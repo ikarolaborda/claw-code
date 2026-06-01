@@ -29,11 +29,23 @@ const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(128);
 const DEFAULT_MAX_RETRIES: u32 = 8;
 
+/// Beta opt-in required for Claude subscription OAuth tokens on `/v1/messages`.
+const OAUTH_SUBSCRIPTION_BETA: &str = "oauth-2025-04-20";
+/// First system block the Anthropic API requires when a request is
+/// authenticated with a Claude subscription OAuth token.
+const CLAUDE_CODE_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthSource {
     None,
     ApiKey(String),
     BearerToken(String),
+    /// A Claude subscription OAuth access token. Distinct from `BearerToken`
+    /// (a generic `ANTHROPIC_AUTH_TOKEN` / gateway token) because the
+    /// subscription path additionally requires the `oauth-2025-04-20` beta
+    /// header and the Claude Code system-prompt identity; applying those to a
+    /// plain gateway bearer would corrupt non-subscription requests.
+    OAuthBearer(String),
     ApiKeyAndBearer {
         api_key: String,
         bearer_token: String,
@@ -59,7 +71,7 @@ impl AuthSource {
     pub fn api_key(&self) -> Option<&str> {
         match self {
             Self::ApiKey(api_key) | Self::ApiKeyAndBearer { api_key, .. } => Some(api_key),
-            Self::None | Self::BearerToken(_) => None,
+            Self::None | Self::BearerToken(_) | Self::OAuthBearer(_) => None,
         }
     }
 
@@ -67,11 +79,31 @@ impl AuthSource {
     pub fn bearer_token(&self) -> Option<&str> {
         match self {
             Self::BearerToken(token)
+            | Self::OAuthBearer(token)
             | Self::ApiKeyAndBearer {
                 bearer_token: token,
                 ..
             } => Some(token),
             Self::None | Self::ApiKey(_) => None,
+        }
+    }
+
+    /// Whether this auth source is a Claude subscription OAuth token, which
+    /// requires the OAuth beta header and the Claude Code system identity.
+    #[must_use]
+    pub fn is_oauth_subscription(&self) -> bool {
+        matches!(self, Self::OAuthBearer(_))
+    }
+
+    /// Secret-free label for diagnostics. Never includes the token/key itself.
+    #[must_use]
+    pub fn variant_label(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::ApiKey(_) => "api_key",
+            Self::BearerToken(_) => "bearer_token",
+            Self::OAuthBearer(_) => "oauth_subscription",
+            Self::ApiKeyAndBearer { .. } => "api_key_and_bearer",
         }
     }
 
@@ -106,7 +138,7 @@ pub struct OAuthTokenSet {
 
 impl From<OAuthTokenSet> for AuthSource {
     fn from(value: OAuthTokenSet) -> Self {
-        Self::BearerToken(value.access_token)
+        Self::OAuthBearer(value.access_token)
     }
 }
 
@@ -143,6 +175,10 @@ impl AnthropicClient {
 
     #[must_use]
     pub fn from_auth(auth: AuthSource) -> Self {
+        let mut request_profile = AnthropicRequestProfile::default();
+        if auth.is_oauth_subscription() {
+            request_profile = request_profile.with_beta(OAUTH_SUBSCRIPTION_BETA);
+        }
         Self {
             http: build_http_client_or_default(),
             auth,
@@ -150,7 +186,7 @@ impl AnthropicClient {
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
             max_backoff: DEFAULT_MAX_BACKOFF,
-            request_profile: AnthropicRequestProfile::default(),
+            request_profile,
             session_tracer: None,
             prompt_cache: None,
             last_prompt_cache_record: Arc::new(Mutex::new(None)),
@@ -470,6 +506,9 @@ impl AnthropicClient {
         let request_url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let mut request_body = self.request_profile.render_json_body(request)?;
         strip_unsupported_beta_body_fields(&mut request_body);
+        if self.auth.is_oauth_subscription() {
+            inject_oauth_subscription_system(&mut request_body);
+        }
         let request_builder = self.build_request(&request_url).json(&request_body);
         request_builder.send().await.map_err(ApiError::from)
     }
@@ -483,7 +522,33 @@ impl AnthropicClient {
         for (header_name, header_value) in self.request_profile.header_pairs() {
             request_builder = request_builder.header(header_name, header_value);
         }
+        if auth_trace_enabled() {
+            eprintln!("{}", self.auth_trace_line(request_url));
+        }
         request_builder
+    }
+
+    /// Secret-free, single-line description of the auth shape applied to a
+    /// request. Used by the `CLAW_AUTH_TRACE` diagnostic so an operator can run
+    /// `claw` once and observe how a subscription token is sent and treated.
+    fn auth_trace_line(&self, request_url: &str) -> String {
+        let beta = self
+            .request_profile
+            .header_pairs()
+            .into_iter()
+            .find(|(name, _)| name == "anthropic-beta")
+            .map(|(_, value)| value)
+            .unwrap_or_else(|| "<none>".to_string());
+        format!(
+            "[claw auth-trace] url={request_url} mode={} x-api-key={} authorization={} anthropic-beta={beta}",
+            self.auth.variant_label(),
+            if self.auth.api_key().is_some() {
+                "present"
+            } else {
+                "<absent>"
+            },
+            self.auth.masked_authorization_header(),
+        )
     }
 
     async fn preflight_message_request(&self, request: &MessageRequest) -> Result<(), ApiError> {
@@ -531,6 +596,9 @@ impl AnthropicClient {
         );
         let mut request_body = self.request_profile.render_json_body(request)?;
         strip_unsupported_beta_body_fields(&mut request_body);
+        if self.auth.is_oauth_subscription() {
+            inject_oauth_subscription_system(&mut request_body);
+        }
         let response = self
             .build_request(&request_url)
             .json(&request_body)
@@ -651,14 +719,14 @@ pub fn resolve_saved_oauth_token(config: &OAuthConfig) -> Result<Option<OAuthTok
 
 pub fn has_auth_from_env_or_saved() -> Result<bool, ApiError> {
     Ok(read_env_non_empty("ANTHROPIC_API_KEY")?.is_some()
-        || read_env_non_empty("ANTHROPIC_AUTH_TOKEN")?.is_some())
+        || read_env_non_empty("ANTHROPIC_AUTH_TOKEN")?.is_some()
+        || load_saved_oauth_token()?.is_some())
 }
 
 pub fn resolve_startup_auth_source<F>(load_oauth_config: F) -> Result<AuthSource, ApiError>
 where
     F: FnOnce() -> Result<Option<OAuthConfig>, ApiError>,
 {
-    let _ = load_oauth_config;
     if let Some(api_key) = read_env_non_empty("ANTHROPIC_API_KEY")? {
         return match read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
             Some(bearer_token) => Ok(AuthSource::ApiKeyAndBearer {
@@ -670,6 +738,15 @@ where
     }
     if let Some(bearer_token) = read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
         return Ok(AuthSource::BearerToken(bearer_token));
+    }
+    // Explicit, lowest-priority fallback: a Claude subscription token saved by
+    // `claw login`. Auto-refreshed when expired. Consulted only when no env
+    // auth is present, so this never silently overrides ANTHROPIC_API_KEY /
+    // ANTHROPIC_AUTH_TOKEN (honors the ROADMAP #37 directive).
+    if let Some(config) = load_oauth_config()? {
+        if let Some(token_set) = resolve_saved_oauth_token(&config)? {
+            return Ok(AuthSource::from(token_set));
+        }
     }
     Err(anthropic_missing_credentials())
 }
@@ -744,6 +821,16 @@ fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
         Ok(_) | Err(std::env::VarError::NotPresent) => Ok(super::dotenv_value(key)),
         Err(error) => Err(ApiError::from(error)),
     }
+}
+
+/// Opt-in (off by default) diagnostic that prints secret-free auth request and
+/// response shapes to stderr. Enable with `CLAW_AUTH_TRACE=1` to observe how a
+/// Claude subscription token is sent and how the API treats the usage.
+fn auth_trace_enabled() -> bool {
+    matches!(
+        std::env::var("CLAW_AUTH_TRACE").ok().as_deref(),
+        Some("1") | Some("true")
+    )
 }
 
 #[cfg(test)]
@@ -865,11 +952,27 @@ impl MessageStream {
 async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response, ApiError> {
     let status = response.status();
     if status.is_success() {
+        if auth_trace_enabled() {
+            eprintln!(
+                "[claw auth-trace] response status={} (success)",
+                status.as_u16()
+            );
+        }
         return Ok(response);
     }
 
     let request_id = request_id_from_headers(response.headers());
     let body = response.text().await.unwrap_or_else(|_| String::new());
+    if auth_trace_enabled() {
+        // The body may name how subscription usage was treated (credit vs
+        // billing vs rejection); print a bounded snippet for diagnosis.
+        let snippet: String = body.chars().take(600).collect();
+        eprintln!(
+            "[claw auth-trace] response status={} request_id={} body={snippet}",
+            status.as_u16(),
+            request_id.as_deref().unwrap_or("<none>"),
+        );
+    }
     let parsed_error = serde_json::from_str::<AnthropicErrorEnvelope>(&body).ok();
     let retryable = is_retryable_status(status);
 
@@ -994,6 +1097,35 @@ fn strip_unsupported_beta_body_fields(body: &mut Value) {
             }
         }
     }
+}
+
+/// Ensure the request body's `system` field is an array whose first block is
+/// the Claude Code identity. The Anthropic API rejects `/v1/messages` requests
+/// authenticated with a Claude subscription OAuth token unless this identity is
+/// the first system block. Idempotent: a body that already leads with the
+/// identity is left unchanged. The caller's own system prompt is preserved as a
+/// following block.
+fn inject_oauth_subscription_system(body: &mut Value) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    let identity = serde_json::json!({ "type": "text", "text": CLAUDE_CODE_IDENTITY });
+    let mut blocks: Vec<Value> = match object.remove("system") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::String(text)) if text.is_empty() => Vec::new(),
+        Some(Value::String(text)) => vec![serde_json::json!({ "type": "text", "text": text })],
+        Some(Value::Array(existing)) => existing,
+        Some(other) => vec![other],
+    };
+    let already_leads = blocks
+        .first()
+        .and_then(|block| block.get("text"))
+        .and_then(Value::as_str)
+        == Some(CLAUDE_CODE_IDENTITY);
+    if !already_leads {
+        blocks.insert(0, identity);
+    }
+    object.insert("system".to_string(), Value::Array(blocks));
 }
 
 #[derive(Debug, Deserialize)]
@@ -1138,6 +1270,105 @@ mod tests {
         });
         assert_eq!(auth.bearer_token(), Some("access-token"));
         assert_eq!(auth.api_key(), None);
+        assert!(
+            auth.is_oauth_subscription(),
+            "a token set must map to the subscription OAuth bearer variant"
+        );
+    }
+
+    #[test]
+    fn generic_bearer_token_is_not_a_subscription() {
+        let auth = AuthSource::BearerToken("gateway-token".to_string());
+        assert!(!auth.is_oauth_subscription());
+    }
+
+    #[test]
+    fn from_auth_adds_oauth_beta_only_for_subscription() {
+        let oauth = AnthropicClient::from_auth(AuthSource::OAuthBearer("t".to_string()));
+        let beta = oauth
+            .request_profile()
+            .header_pairs()
+            .into_iter()
+            .find(|(name, _)| name == "anthropic-beta")
+            .map(|(_, value)| value)
+            .unwrap_or_default();
+        assert!(
+            beta.contains(super::OAUTH_SUBSCRIPTION_BETA),
+            "subscription client must opt into the oauth beta, got: {beta}"
+        );
+
+        let key = AnthropicClient::from_auth(AuthSource::ApiKey("sk".to_string()));
+        let key_beta = key
+            .request_profile()
+            .header_pairs()
+            .into_iter()
+            .find(|(name, _)| name == "anthropic-beta")
+            .map(|(_, value)| value)
+            .unwrap_or_default();
+        assert!(
+            !key_beta.contains(super::OAUTH_SUBSCRIPTION_BETA),
+            "api-key client must not send the oauth beta, got: {key_beta}"
+        );
+    }
+
+    #[test]
+    fn auth_trace_line_masks_secrets_and_reports_shape() {
+        let client = AnthropicClient::from_auth(AuthSource::OAuthBearer(
+            "supersecret-access-token".to_string(),
+        ));
+        let line = client.auth_trace_line("https://api.anthropic.com/v1/messages");
+        assert!(
+            !line.contains("supersecret-access-token"),
+            "auth trace must never leak the token, got: {line}"
+        );
+        assert!(line.contains("mode=oauth_subscription"));
+        assert!(line.contains("authorization=Bearer [REDACTED]"));
+        assert!(line.contains(super::OAUTH_SUBSCRIPTION_BETA));
+        assert!(line.contains("x-api-key=<absent>"));
+    }
+
+    #[test]
+    fn api_key_auth_trace_masks_key() {
+        let client = AnthropicClient::new("sk-ant-supersecret");
+        let line = client.auth_trace_line("https://api.anthropic.com/v1/messages");
+        assert!(
+            !line.contains("sk-ant-supersecret"),
+            "auth trace must never leak the api key, got: {line}"
+        );
+        assert!(line.contains("mode=api_key"));
+        assert!(line.contains("x-api-key=present"));
+    }
+
+    #[test]
+    fn auth_trace_is_off_by_default() {
+        let _guard = env_lock();
+        std::env::remove_var("CLAW_AUTH_TRACE");
+        assert!(!super::auth_trace_enabled());
+        std::env::set_var("CLAW_AUTH_TRACE", "1");
+        assert!(super::auth_trace_enabled());
+        std::env::remove_var("CLAW_AUTH_TRACE");
+    }
+
+    #[test]
+    fn inject_oauth_subscription_system_prepends_identity_and_is_idempotent() {
+        use super::CLAUDE_CODE_IDENTITY;
+        // String system => array with identity first, original preserved.
+        let mut body = serde_json::json!({ "system": "Project rules." });
+        super::inject_oauth_subscription_system(&mut body);
+        let blocks = body["system"].as_array().expect("system array");
+        assert_eq!(blocks[0]["text"], CLAUDE_CODE_IDENTITY);
+        assert_eq!(blocks[1]["text"], "Project rules.");
+
+        // Running again must not duplicate the identity block.
+        super::inject_oauth_subscription_system(&mut body);
+        let blocks = body["system"].as_array().expect("system array");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["text"], CLAUDE_CODE_IDENTITY);
+
+        // Missing system => identity-only array.
+        let mut empty = serde_json::json!({ "model": "x" });
+        super::inject_oauth_subscription_system(&mut empty);
+        assert_eq!(empty["system"][0]["text"], CLAUDE_CODE_IDENTITY);
     }
 
     #[test]
@@ -1224,7 +1455,33 @@ mod tests {
     }
 
     #[test]
-    fn resolve_startup_auth_source_ignores_saved_oauth_without_loading_config() {
+    fn resolve_startup_auth_source_errors_when_no_env_and_no_oauth_config() {
+        let _guard = env_lock();
+        let config_home = temp_config_home();
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        // Even with a saved token on disk, no OAuth config means the saved token
+        // cannot be resolved/refreshed, so startup auth still errors.
+        save_oauth_credentials(&runtime::OAuthTokenSet {
+            access_token: "saved-access-token".to_string(),
+            refresh_token: Some("refresh".to_string()),
+            expires_at: Some(now_unix_timestamp() + 300),
+            scopes: vec!["scope:a".to_string()],
+        })
+        .expect("save oauth credentials");
+
+        let error = resolve_startup_auth_source(|| Ok(None))
+            .expect_err("no env auth and no oauth config should error");
+        assert!(error.to_string().contains("ANTHROPIC_API_KEY"));
+
+        clear_oauth_credentials().expect("clear credentials");
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        cleanup_temp_config_home(&config_home);
+    }
+
+    #[test]
+    fn resolve_startup_auth_source_uses_saved_oauth_when_env_absent() {
         let _guard = env_lock();
         let config_home = temp_config_home();
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
@@ -1238,11 +1495,44 @@ mod tests {
         })
         .expect("save oauth credentials");
 
-        let error = resolve_startup_auth_source(|| panic!("config should not be loaded"))
-            .expect_err("saved oauth should be ignored");
-        assert!(error.to_string().contains("ANTHROPIC_API_KEY"));
+        // Non-expired token => no refresh call; token_url is never hit.
+        let auth = resolve_startup_auth_source(|| {
+            Ok(Some(sample_oauth_config(
+                "https://unused.test/token".to_string(),
+            )))
+        })
+        .expect("saved oauth should resolve to a bearer auth source");
+        assert!(auth.is_oauth_subscription());
+        assert_eq!(auth.bearer_token(), Some("saved-access-token"));
 
         clear_oauth_credentials().expect("clear credentials");
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        cleanup_temp_config_home(&config_home);
+    }
+
+    #[test]
+    fn env_auth_wins_over_saved_oauth() {
+        let _guard = env_lock();
+        let config_home = temp_config_home();
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::set_var("ANTHROPIC_API_KEY", "env-key");
+        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        save_oauth_credentials(&runtime::OAuthTokenSet {
+            access_token: "saved-access-token".to_string(),
+            refresh_token: Some("refresh".to_string()),
+            expires_at: Some(now_unix_timestamp() + 300),
+            scopes: vec!["scope:a".to_string()],
+        })
+        .expect("save oauth credentials");
+
+        let auth =
+            resolve_startup_auth_source(|| panic!("config must not load when env auth present"))
+                .expect("env auth should resolve without touching saved oauth");
+        assert_eq!(auth.api_key(), Some("env-key"));
+        assert!(!auth.is_oauth_subscription());
+
+        clear_oauth_credentials().expect("clear credentials");
+        std::env::remove_var("ANTHROPIC_API_KEY");
         std::env::remove_var("CLAW_CONFIG_HOME");
         cleanup_temp_config_home(&config_home);
     }

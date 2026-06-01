@@ -209,11 +209,61 @@ Model aliases currently supported by the CLI:
 export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
-### OAuth
+### OAuth (gateway / proxy bearer token)
 
 ```bash
 cd rust
 export ANTHROPIC_AUTH_TOKEN="anthropic-oauth-or-proxy-bearer-token"
+```
+
+### Claude subscription login (`claw login`)
+
+If you have a Claude Pro or Max subscription, sign in with OAuth instead of an
+API key:
+
+```bash
+claw login    # opens your browser; falls back to pasting a code if needed
+claw logout   # removes the saved token
+```
+
+`claw login` runs the standard OAuth PKCE flow against Anthropic's first-party
+Claude Code client and saves the token to `~/.claw/credentials.json`. After
+login, the token is used **automatically** — but only as a *lowest-priority*
+source: if `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` is set, those win. The
+saved token is refreshed automatically when it expires. `claw doctor` shows
+which auth source is effective.
+
+When a subscription token is used, `claw` sends `Authorization: Bearer <token>`
+with the `anthropic-beta: oauth-2025-04-20` opt-in and prepends the required
+Claude Code system identity — no `x-api-key` is sent.
+
+#### Diagnosing subscription auth (`CLAW_AUTH_TRACE`)
+
+To see exactly how your token is sent and how the API treats the usage (useful
+for confirming whether subscription usage draws from your plan), run once with:
+
+```bash
+CLAW_AUTH_TRACE=1 claw -p "hi"
+```
+
+This prints secret-free trace lines to stderr — the auth mode, whether
+`x-api-key`/`Authorization` are present (the token is masked, never printed),
+the `anthropic-beta` value, and the response status plus a bounded body snippet
+on rejection. It is off by default.
+
+Override the OAuth client/endpoints (e.g. to point at an internal proxy) via the
+`oauth` block in your settings file:
+
+```json
+{
+  "oauth": {
+    "clientId": "your-client-id",
+    "authorizeUrl": "https://your-issuer/oauth/authorize",
+    "tokenUrl": "https://your-issuer/oauth/token",
+    "callbackPort": 4545,
+    "scopes": ["org:create_api_key", "user:profile", "user:inference"]
+  }
+}
 ```
 
 ### Which env var goes where
@@ -224,6 +274,7 @@ export ANTHROPIC_AUTH_TOKEN="anthropic-oauth-or-proxy-bearer-token"
 |---|---|---|---|
 | `sk-ant-*` API key | `ANTHROPIC_API_KEY` | `x-api-key: sk-ant-...` | [console.anthropic.com](https://console.anthropic.com) |
 | OAuth access token (opaque) | `ANTHROPIC_AUTH_TOKEN` | `Authorization: Bearer ...` | an Anthropic-compatible proxy or OAuth flow that mints bearer tokens |
+| Claude subscription token | saved by `claw login` (no env var) | `Authorization: Bearer ...` + `anthropic-beta: oauth-2025-04-20` | a Claude Pro/Max subscription |
 | OpenRouter key (`sk-or-v1-*`) | `OPENAI_API_KEY` + `OPENAI_BASE_URL=https://openrouter.ai/api/v1` | `Authorization: Bearer ...` | [openrouter.ai/keys](https://openrouter.ai/keys) |
 
 **Why this matters:** if you paste an `sk-ant-*` key into `ANTHROPIC_AUTH_TOKEN`, Anthropic's API will return `401 Invalid bearer token` because `sk-ant-*` keys are rejected over the Bearer header. The fix is a one-line env var swap — move the key to `ANTHROPIC_API_KEY`. Recent `claw` builds detect this exact shape (401 + `sk-ant-*` in the Bearer slot) and append a hint to the error message pointing at the fix.

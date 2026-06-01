@@ -221,6 +221,41 @@ pub struct OAuthConfig {
     pub scopes: Vec<String>,
 }
 
+/// Public OAuth client id used by Anthropic's first-party Claude Code login
+/// flow. Shipping it as the default lets a Claude Pro/Max subscriber run
+/// `claw login` without hand-configuring `settings.oauth`. Operators who want
+/// a different client (e.g. an internal proxy) override the whole block via
+/// `settings.oauth`.
+pub const DEFAULT_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+/// Authorization endpoint for the Claude subscription login flow.
+pub const DEFAULT_OAUTH_AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
+/// Token endpoint that exchanges/refreshes Claude subscription OAuth tokens.
+pub const DEFAULT_OAUTH_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
+/// Console redirect that displays the authorization code for manual paste when
+/// the loopback callback server cannot be reached.
+pub const DEFAULT_OAUTH_MANUAL_REDIRECT_URL: &str =
+    "https://console.anthropic.com/oauth/code/callback";
+
+impl OAuthConfig {
+    /// Built-in OAuth client configuration for Anthropic's Claude subscription
+    /// login flow. Used when no `settings.oauth` override is present.
+    #[must_use]
+    pub fn claude_subscription_default() -> Self {
+        Self {
+            client_id: DEFAULT_OAUTH_CLIENT_ID.to_string(),
+            authorize_url: DEFAULT_OAUTH_AUTHORIZE_URL.to_string(),
+            token_url: DEFAULT_OAUTH_TOKEN_URL.to_string(),
+            callback_port: None,
+            manual_redirect_url: Some(DEFAULT_OAUTH_MANUAL_REDIRECT_URL.to_string()),
+            scopes: vec![
+                "org:create_api_key".to_string(),
+                "user:profile".to_string(),
+                "user:inference".to_string(),
+            ],
+        }
+    }
+}
+
 /// Errors raised while reading or parsing runtime configuration files.
 #[derive(Debug)]
 pub enum ConfigError {

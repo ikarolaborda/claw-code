@@ -271,7 +271,7 @@ fn a2_api_key_only_uses_x_api_key_without_oauth_markers() {
         req.headers
     );
     assert!(
-        req.headers.get("authorization").is_none(),
+        !req.headers.contains_key("authorization"),
         "api-key auth must not send a bearer authorization; headers: {:?}",
         req.headers
     );
@@ -311,7 +311,7 @@ fn a2_api_key_wins_over_saved_oauth_and_no_marker_leak() {
         req.headers
     );
     assert!(
-        req.headers.get("authorization").is_none(),
+        !req.headers.contains_key("authorization"),
         "the saved OAuth token must not leak as a bearer when an API key is present; headers: {:?}",
         req.headers
     );

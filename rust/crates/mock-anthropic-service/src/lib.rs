@@ -165,11 +165,49 @@ fn normalize_request_body(raw_body: &str) -> io::Result<Value> {
     Ok(value)
 }
 
+/// Access token the mock OAuth token endpoint returns on a successful refresh.
+/// Tests assert the subsequent `/v1/messages` request carries this as its bearer.
+pub const REFRESHED_OAUTH_ACCESS_TOKEN: &str = "refreshed-by-mock-token";
+
 async fn handle_connection(
     mut socket: tokio::net::TcpStream,
     requests: Arc<Mutex<Vec<CapturedRequest>>>,
 ) -> io::Result<()> {
     let (method, path, headers, raw_body) = read_http_request(&mut socket).await?;
+
+    // OAuth token endpoint(s) for the subscription refresh flow. The body is
+    // form-encoded (not a MessageRequest), so handle these before the strict
+    // parse below. `/oauth/token` succeeds; `/oauth/token-fail` models a
+    // non-transient refresh failure.
+    if path == "/oauth/token" || path == "/oauth/token-fail" {
+        requests.lock().await.push(CapturedRequest {
+            method,
+            path: path.clone(),
+            headers,
+            scenario: "oauth_token".to_string(),
+            stream: false,
+            raw_body,
+        });
+        let response = if path == "/oauth/token" {
+            let body = serde_json::to_string(&json!({
+                "access_token": REFRESHED_OAUTH_ACCESS_TOKEN,
+                "refresh_token": "rotated-refresh-token",
+                "expires_at": 4_102_444_800_u64,
+                "scopes": ["user:inference"],
+            }))
+            .expect("token json");
+            http_response("200 OK", "application/json", &body, &[])
+        } else {
+            http_response(
+                "400 Bad Request",
+                "application/json",
+                "{\"error\":\"invalid_grant\"}",
+                &[],
+            )
+        };
+        socket.write_all(response.as_bytes()).await?;
+        return Ok(());
+    }
     // The Claude subscription (OAuth) path rewrites `system` into an array of
     // content blocks, but the api crate's `MessageRequest` models `system` as
     // `Option<String>`, so a strict parse of that body fails. Normalize an array

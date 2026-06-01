@@ -347,3 +347,124 @@ fn a2_no_credentials_fails_without_sending_a_request() {
 
     fs::remove_dir_all(&ws.root).ok();
 }
+
+/// Write a settings.json that overrides the OAuth client so the refresh flow
+/// targets the mock's token endpoint instead of the real console endpoint.
+fn write_oauth_settings(config_home: &Path, base_url: &str, token_path: &str) {
+    let settings = json!({
+        "oauth": {
+            "clientId": "test-client",
+            "authorizeUrl": format!("{base_url}/oauth/authorize"),
+            "tokenUrl": format!("{base_url}{token_path}"),
+        }
+    });
+    fs::write(
+        config_home.join("settings.json"),
+        serde_json::to_vec_pretty(&settings).expect("settings json"),
+    )
+    .expect("write settings.json");
+}
+
+/// Write an EXPIRED saved OAuth credential (with a refresh token) so the startup
+/// path performs a refresh before using it.
+fn write_expired_oauth_token(config_home: &Path, access_token: &str, refresh_token: &str) {
+    let creds = json!({
+        "oauth": {
+            "accessToken": access_token,
+            "refreshToken": refresh_token,
+            "expiresAt": 1000,
+            "scopes": ["user:inference"],
+        }
+    });
+    fs::write(
+        config_home.join("credentials.json"),
+        serde_json::to_vec_pretty(&creds).expect("creds json"),
+    )
+    .expect("write credentials.json");
+}
+
+/// A3 (refresh success + persistence) — an expired saved token is refreshed at
+/// the OAuth token endpoint, the new bearer is used for `/v1/messages`, and the
+/// refreshed credential is persisted back to disk.
+#[test]
+fn a3_expired_token_is_refreshed_persisted_and_new_bearer_used() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service");
+    let base_url = server.base_url();
+
+    let ws = workspace("a3-ok");
+    write_oauth_settings(&ws.config_home, &base_url, "/oauth/token");
+    write_expired_oauth_token(&ws.config_home, "expired-access", "old-refresh");
+
+    let output = run_claw_oauth_only(&ws, &base_url, "streaming_text");
+    assert_ok(&output);
+
+    let captured = runtime.block_on(server.captured_requests());
+    assert!(
+        captured.iter().any(|r| r.path == "/oauth/token"),
+        "the expired token must trigger a refresh at the token endpoint; captured: {captured:?}"
+    );
+    let messages = messages_of(&captured);
+    assert_eq!(messages.len(), 1, "exactly one /v1/messages request");
+    assert_eq!(
+        messages[0].headers.get("authorization").map(String::as_str),
+        Some(
+            format!(
+                "Bearer {}",
+                mock_anthropic_service::REFRESHED_OAUTH_ACCESS_TOKEN
+            )
+            .as_str()
+        ),
+        "messages must use the refreshed bearer; headers: {:?}",
+        messages[0].headers
+    );
+
+    // Persistence: the refreshed token is written back to credentials.json.
+    let creds: Value = serde_json::from_str(
+        &fs::read_to_string(ws.config_home.join("credentials.json")).expect("read creds"),
+    )
+    .expect("creds json");
+    assert_eq!(
+        creds["oauth"]["accessToken"].as_str(),
+        Some(mock_anthropic_service::REFRESHED_OAUTH_ACCESS_TOKEN),
+        "the refreshed access token must be persisted; creds: {creds}"
+    );
+
+    fs::remove_dir_all(&ws.root).ok();
+}
+
+/// A3 (refresh failure) — a non-transient refresh failure aborts the run with a
+/// clear error and no `/v1/messages` request is sent.
+#[test]
+fn a3_refresh_failure_aborts_without_sending_messages() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service");
+    let base_url = server.base_url();
+
+    let ws = workspace("a3-fail");
+    write_oauth_settings(&ws.config_home, &base_url, "/oauth/token-fail");
+    write_expired_oauth_token(&ws.config_home, "expired-access", "old-refresh");
+
+    let output = run_claw_oauth_only(&ws, &base_url, "streaming_text");
+    assert!(
+        !output.status.success(),
+        "a failed refresh must abort the run; stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let captured = runtime.block_on(server.captured_requests());
+    assert!(
+        captured.iter().any(|r| r.path == "/oauth/token-fail"),
+        "the refresh must have been attempted; captured: {captured:?}"
+    );
+    assert!(
+        messages_of(&captured).is_empty(),
+        "no model request should be sent after a failed refresh; captured: {captured:?}"
+    );
+
+    fs::remove_dir_all(&ws.root).ok();
+}

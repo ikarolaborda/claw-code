@@ -147,12 +147,36 @@ impl Scenario {
     }
 }
 
+/// Parse the raw request body and coerce an array `system` (subscription OAuth
+/// shape) into the `Option<String>` form the strict `MessageRequest` expects.
+fn normalize_request_body(raw_body: &str) -> io::Result<Value> {
+    let mut value: Value = serde_json::from_str(raw_body)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    if let Some(object) = value.as_object_mut() {
+        if let Some(Value::Array(blocks)) = object.get("system").cloned() {
+            let joined = blocks
+                .iter()
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            object.insert("system".to_string(), Value::String(joined));
+        }
+    }
+    Ok(value)
+}
+
 async fn handle_connection(
     mut socket: tokio::net::TcpStream,
     requests: Arc<Mutex<Vec<CapturedRequest>>>,
 ) -> io::Result<()> {
     let (method, path, headers, raw_body) = read_http_request(&mut socket).await?;
-    let request: MessageRequest = serde_json::from_str(&raw_body)
+    // The Claude subscription (OAuth) path rewrites `system` into an array of
+    // content blocks, but the api crate's `MessageRequest` models `system` as
+    // `Option<String>`, so a strict parse of that body fails. Normalize an array
+    // `system` back to a joined string before parsing — the mock never uses
+    // `system`, and `raw_body` is captured verbatim so callers can still assert
+    // the original array shape.
+    let request: MessageRequest = serde_json::from_value(normalize_request_body(&raw_body)?)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
     let scenario = detect_scenario(&request)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parity scenario"))?;
@@ -1133,4 +1157,35 @@ fn extract_plugin_message(tool_output: &str) -> String {
                 .map(ToOwned::to_owned)
         })
         .unwrap_or_else(|| tool_output.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_request_body;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn string_system_is_unchanged() {
+        let raw = json!({"system": "plain", "messages": []}).to_string();
+        let out = normalize_request_body(&raw).expect("parse");
+        assert_eq!(out["system"], Value::String("plain".to_string()));
+    }
+
+    #[test]
+    fn array_system_is_joined_for_parsing() {
+        let raw = json!({
+            "system": [
+                {"type": "text", "text": "You are Claude Code."},
+                {"type": "text", "text": "Caller prompt."}
+            ],
+            "messages": []
+        })
+        .to_string();
+        let out = normalize_request_body(&raw).expect("parse");
+        assert_eq!(
+            out["system"],
+            Value::String("You are Claude Code.\n\nCaller prompt.".to_string()),
+            "array blocks are joined so the strict MessageRequest parse succeeds"
+        );
+    }
 }

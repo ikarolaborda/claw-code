@@ -5041,6 +5041,10 @@ fn run_repl(
     println!("{}", cli.startup_banner());
     println!("{}", format_connected_line(&cli.model));
 
+    // Kairos dream-on-start (B3). No-op unless the Kairos gate is enabled, so
+    // the default REPL path stays byte-identical to baseline.
+    maybe_spawn_startup_dream();
+
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
         match editor.read_line()? {
@@ -10204,6 +10208,75 @@ format exactly."
         }
     }
     Ok(())
+}
+
+/// Dream-on-start scheduler (E2E_TEST_PLAN B3). When the Kairos layer is enabled
+/// and no dream has yet covered today, kick off one best-effort dream in a
+/// detached background thread so the interactive session is never blocked.
+///
+/// Deliberately quiet and side-effect-contained: when the gate is off this is a
+/// no-op with no marker read, no spawn, and no output (preserving Kairos-OFF
+/// byte identity); when it spawns, the thread owns all its resources (its own
+/// auth resolution, client, and tokio runtime built *inside* the closure — only
+/// owned `String`/`usize` are captured) and writes nothing to the user's
+/// streams. Failures are swallowed: [`runtime::run_dream`] advances the
+/// last-dream marker only on success, so an interrupted or failed dream simply
+/// re-runs on the next start rather than corrupting state. The decision itself
+/// is the pure, unit-tested [`runtime::startup_dream_action`].
+fn maybe_spawn_startup_dream() {
+    // Gate first: when Kairos is off, do nothing at all — no clock read, no
+    // marker read, no spawn — so the default REPL path is byte-identical.
+    if !runtime::kairos_enabled() {
+        return;
+    }
+    let today = runtime::JournalDate::today_utc();
+    let last_dream = runtime::read_last_dream().unwrap_or(None);
+    if runtime::startup_dream_action(true, last_dream, today) != runtime::StartupAction::SpawnDream
+    {
+        return;
+    }
+
+    let model = ModelProvenance::from_env_or_config_or_default(DEFAULT_MODEL).resolved;
+    let max_tokens = max_tokens_for_model(&model);
+
+    let _ = std::thread::Builder::new()
+        .name("kairos-dream".to_string())
+        .spawn(move || {
+            let completer = |prompt: &str| -> io::Result<String> {
+                let auth = resolve_cli_auth_source()
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                let client = AnthropicClient::from_auth(auth).with_base_url(api::read_base_url());
+                let request = MessageRequest {
+                    model: model.clone(),
+                    max_tokens,
+                    messages: vec![InputMessage::user_text(prompt)],
+                    system: Some(
+                        "You distill an agent's raw journal into durable memories. Follow the \
+output format exactly."
+                            .to_string(),
+                    ),
+                    stream: false,
+                    ..Default::default()
+                };
+                let runtime = tokio::runtime::Runtime::new()?;
+                let response = runtime
+                    .block_on(client.send_message(&request))
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                let text = response
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        OutputContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                Ok(text)
+            };
+            // Best-effort: any error (auth, network, parse) leaves the marker
+            // unadvanced, so the next start retries. Nothing is surfaced.
+            let _ = runtime::run_dream(today, &runtime::DreamOptions::default(), completer);
+        });
 }
 
 /// Best-effort browser launch. Failure is non-fatal: the URL was already

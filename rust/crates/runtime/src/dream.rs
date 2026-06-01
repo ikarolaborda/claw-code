@@ -131,6 +131,38 @@ fn day_is_after(day: JournalDate, marker: JournalDate) -> bool {
     (day.year, day.month, day.day) > (marker.year, marker.month, marker.day)
 }
 
+/// Whether a dream is due when the agent starts up, given the last-dream marker
+/// and today's date. See [`dream_on_start_decision`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DreamOnStartDecision {
+    /// No dream has yet processed a day on or after `today` — a dream is due.
+    Run,
+    /// A dream has already covered `today` (marker == today), or the marker is
+    /// dated in the future (clock skew / hand-edited marker) — nothing to do.
+    SkipUpToDate,
+}
+
+/// Pure dream-on-start scheduling decision (E2E_TEST_PLAN B3). Clock-free: the
+/// caller supplies `today`, so the result is fully deterministic under test.
+///
+/// `Run` iff no dream has yet processed a day on or after `today`. This makes
+/// same-day restarts idempotent: once a dream advances the marker to `today`,
+/// every further start that day returns `SkipUpToDate`. A future-dated marker is
+/// treated as up-to-date rather than re-dreaming the future. This is only a
+/// cheap pre-flight guard — [`run_dream`] is independently idempotent (its
+/// eligible set is the journal days strictly after the marker), so a spurious
+/// `Run` still distills nothing when there is no new day.
+#[must_use]
+pub fn dream_on_start_decision(
+    last_dream: Option<JournalDate>,
+    today: JournalDate,
+) -> DreamOnStartDecision {
+    match last_dream {
+        Some(marker) if !day_is_after(today, marker) => DreamOnStartDecision::SkipUpToDate,
+        _ => DreamOnStartDecision::Run,
+    }
+}
+
 /// Normalize a free-form topic into a filesystem-safe slug. Lowercased ASCII
 /// alphanumerics, every other run collapsed to a single `-`. Centralised so the
 /// in-run collision check and the on-disk filename always agree.

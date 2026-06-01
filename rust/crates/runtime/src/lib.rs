@@ -21,6 +21,7 @@ pub mod green_contract;
 mod hooks;
 mod journal;
 mod json;
+pub mod kairos;
 mod lane_events;
 pub mod lsp_client;
 mod mcp;
@@ -86,8 +87,9 @@ pub use conversation::{
     ToolExecutor, TurnSummary,
 };
 pub use dream::{
-    build_distill_prompt, memory_root, parse_distilled, read_last_dream, run_dream, slugify,
-    write_distilled, DistilledMemory, DreamOptions, DreamOutcome, ParseResult,
+    build_distill_prompt, dream_on_start_decision, memory_root, parse_distilled, read_last_dream,
+    run_dream, slugify, write_distilled, DistilledMemory, DreamOnStartDecision, DreamOptions,
+    DreamOutcome, ParseResult,
 };
 pub use file_ops::{
     edit_file, edit_file_in_workspace, glob_search, glob_search_in_workspace, grep_search,
@@ -102,6 +104,10 @@ pub use hooks::{
 pub use journal::{
     append_entry, append_entry_on, journal_path_for, journal_root, list_journal_days, read_day,
     JournalDate,
+};
+pub use kairos::{
+    kairos_enabled, startup_dream_action, AutonomousSignal, IdleBriefPolicy, StartupAction,
+    KAIROS_ENV,
 };
 pub use lane_events::{
     compute_event_fingerprint, dedupe_superseded_commit_events, dedupe_terminal_events,

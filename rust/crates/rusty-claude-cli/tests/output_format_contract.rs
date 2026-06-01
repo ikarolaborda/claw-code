@@ -2094,43 +2094,65 @@ fn config_parse_error_has_typed_error_kind_and_hint_764() {
 }
 
 #[test]
-fn login_logout_removed_subcommands_have_error_kind_and_hint_765() {
-    // #765: `claw login` and `claw logout` are removed; JSON envelope must carry
-    // error_kind:removed_subcommand + non-null hint pointing to the env var migration.
-    // Before fix: single-line error string → error_kind:"unknown" + hint:null.
-    let root = unique_temp_dir("login-logout-removed-765");
+fn login_logout_subcommands_are_supported() {
+    // login/logout are the Claude subscription OAuth auth surface (re-added).
+    // `logout` is safe + idempotent, so we can exercise the happy path against an
+    // isolated CLAW_CONFIG_HOME. `login` enters a blocking interactive flow, so
+    // we only assert it is *wired* (recognized subcommand, not "removed").
+    let root = unique_temp_dir("login-logout-supported");
     fs::create_dir_all(&root).expect("temp dir should exist");
+    let config_home = root.to_str().expect("temp dir is valid utf8");
 
-    for subcmd in &["login", "logout"] {
-        let output = run_claw(&root, &["--output-format", "json", subcmd], &[]);
-        assert!(
-            !output.status.success(),
-            "claw {subcmd} should exit non-zero"
-        );
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let json_line = stdout
-            .lines()
-            .find(|l| l.trim_start().starts_with('{'))
-            .unwrap_or_else(|| panic!("claw {subcmd} stdout should contain a JSON envelope (#819/#820/#823: abort envelopes route to stdout in JSON mode)"));
-        let parsed: serde_json::Value =
-            serde_json::from_str(json_line).expect("error envelope should be valid JSON");
+    // logout: succeeds and reports a structured status without touching real creds.
+    let output = run_claw(
+        &root,
+        &["--output-format", "json", "logout"],
+        &[("CLAW_CONFIG_HOME", config_home)],
+    );
+    assert!(
+        output.status.success(),
+        "claw logout should exit zero, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // `claw logout --output-format json` emits a pretty (multi-line) envelope,
+    // matching every other CLI command, so parse the whole stdout object.
+    let raw = stdout.trim();
+    assert!(
+        raw.starts_with('{'),
+        "logout stdout should contain a JSON envelope, got: {stdout}"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(raw).expect("logout envelope should be valid JSON");
+    assert_eq!(
+        parsed["status"], "logged_out",
+        "claw logout must report status:logged_out"
+    );
 
-        assert_eq!(
-            parsed["error_kind"], "removed_subcommand",
-            "claw {subcmd} must return error_kind:removed_subcommand (#765)"
-        );
-        let hint = parsed["hint"].as_str().unwrap_or("");
-        assert!(
-            !hint.is_empty(),
-            "claw {subcmd} must return non-null hint (#765), got: {hint:?}"
-        );
-        assert!(
-            hint.contains("ANTHROPIC_API_KEY") || hint.contains("ANTHROPIC_AUTH_TOKEN"),
-            "claw {subcmd} hint must mention the env var migration path, got: {hint:?}"
-        );
-    }
+    // login is recognized: an extra positional fails at parse time (before the
+    // blocking OAuth flow) and must NOT report the old "removed" error.
+    let output = run_claw(
+        &root,
+        &["login", "unexpected-extra"],
+        &[("CLAW_CONFIG_HOME", config_home)],
+    );
+    assert!(
+        !output.status.success(),
+        "claw login with extra args should fail at parse time"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("unexpected extra arguments"),
+        "claw login should be a wired subcommand, got: {combined}"
+    );
+    assert!(
+        !combined.contains("has been removed"),
+        "claw login must not report as a removed subcommand, got: {combined}"
+    );
 }
 
 #[test]

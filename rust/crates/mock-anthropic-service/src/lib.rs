@@ -13,6 +13,11 @@ use tokio::task::JoinHandle;
 pub const SCENARIO_PREFIX: &str = "PARITY_SCENARIO:";
 pub const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 
+/// Canned reply for the `dream_distill` scenario. Prose surrounds the memory
+/// block on purpose so the end-to-end test also exercises the tolerant parser
+/// (which must ignore everything outside `<<<MEMORY>>> … <<<END>>>`).
+const DREAM_DISTILL_REPLY: &str = "Here are the distilled memories from the journal.\n\n<<<MEMORY>>>\ntopic: E2E Dream Verified\nThe `claw dream` end-to-end path reads the journal, calls the model, and writes durable memories under config_home/memory.\n<<<END>>>\n\nThat is everything worth keeping.";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedRequest {
     pub method: String,
@@ -100,6 +105,7 @@ enum Scenario {
     PluginToolRoundtrip,
     AutoCompactTriggered,
     TokenCostReporting,
+    DreamDistill,
 }
 
 impl Scenario {
@@ -117,6 +123,7 @@ impl Scenario {
             "plugin_tool_roundtrip" => Some(Self::PluginToolRoundtrip),
             "auto_compact_triggered" => Some(Self::AutoCompactTriggered),
             "token_cost_reporting" => Some(Self::TokenCostReporting),
+            "dream_distill" => Some(Self::DreamDistill),
             _ => None,
         }
     }
@@ -135,6 +142,7 @@ impl Scenario {
             Self::PluginToolRoundtrip => "plugin_tool_roundtrip",
             Self::AutoCompactTriggered => "auto_compact_triggered",
             Self::TokenCostReporting => "token_cost_reporting",
+            Self::DreamDistill => "dream_distill",
         }
     }
 }
@@ -464,6 +472,9 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
         Scenario::TokenCostReporting => {
             final_text_sse_with_usage("token cost reporting parity complete.", 1_000, 500)
         }
+        // `claw dream` always sends `stream: false`; this arm exists only to keep
+        // the match exhaustive and stays consistent with the non-streaming reply.
+        Scenario::DreamDistill => final_text_sse(DREAM_DISTILL_REPLY),
     }
 }
 
@@ -474,6 +485,7 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
             "msg_streaming_text",
             "Mock streaming says hello from the parity harness.",
         ),
+        Scenario::DreamDistill => text_message_response("msg_dream_distill", DREAM_DISTILL_REPLY),
         Scenario::ReadFileRoundtrip => match latest_tool_result(request) {
             Some((tool_output, _)) => text_message_response(
                 "msg_read_file_final",
@@ -640,6 +652,7 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
 fn request_id_for(scenario: Scenario) -> &'static str {
     match scenario {
         Scenario::StreamingText => "req_streaming_text",
+        Scenario::DreamDistill => "req_dream_distill",
         Scenario::ReadFileRoundtrip => "req_read_file_roundtrip",
         Scenario::GrepChunkAssembly => "req_grep_chunk_assembly",
         Scenario::WriteFileAllowed => "req_write_file_allowed",

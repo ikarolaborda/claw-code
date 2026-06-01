@@ -53,13 +53,16 @@ use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
-    check_base_commit, format_stale_base_warning, format_usd, load_oauth_credentials,
-    load_system_prompt, pricing_for_model, resolve_expected_base, resolve_sandbox_status,
-    ApiClient, ApiRequest, AssistantEvent, BaseCommitState, CompactionConfig, ConfigLoader,
-    ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, McpServer,
-    McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode,
-    PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError,
-    Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    check_base_commit, clear_oauth_credentials, format_stale_base_warning, format_usd,
+    generate_pkce_pair, generate_state, load_oauth_credentials, load_system_prompt,
+    loopback_redirect_uri, parse_oauth_callback_request_target, pricing_for_model,
+    resolve_expected_base, resolve_sandbox_status, save_oauth_credentials, ApiClient, ApiRequest,
+    AssistantEvent, BaseCommitState, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
+    ConversationMessage, ConversationRuntime, McpServer, McpServerManager, McpServerSpec, McpTool,
+    MessageRole, ModelPricing, OAuthAuthorizationRequest, OAuthCallbackParams, OAuthConfig,
+    OAuthTokenExchangeRequest, OAuthTokenSet, PermissionMode, PermissionPolicy, ProjectContext,
+    PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage, ToolError,
+    ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -628,6 +631,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Acp { output_format } => print_acp_status(output_format)?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
+        CliAction::Login { output_format } => run_login(output_format)?,
+        CliAction::Logout { output_format } => run_logout(output_format)?,
+        CliAction::Dream { output_format } => run_dream_command(output_format)?,
         // #146: dispatch pure-local introspection. Text mode uses existing
         // render_config_report/render_diff_report; JSON mode uses the
         // corresponding _json helpers already exposed for resume sessions.
@@ -719,6 +725,15 @@ enum CliAction {
         output_format: CliOutputFormat,
     },
     Version {
+        output_format: CliOutputFormat,
+    },
+    Login {
+        output_format: CliOutputFormat,
+    },
+    Logout {
+        output_format: CliOutputFormat,
+    },
+    Dream {
         output_format: CliOutputFormat,
     },
     ResumeSession {
@@ -1337,7 +1352,33 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         }
         "system-prompt" => parse_system_prompt_args(&rest[1..], model, output_format),
         "acp" => parse_acp_args(&rest[1..], output_format),
-        "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
+        "login" => {
+            if rest.len() > 1 {
+                return Err(format!(
+                    "unexpected extra arguments after `claw login`: {}\nUsage: claw login [--output-format <text|json>]",
+                    rest[1..].join(" ")
+                ));
+            }
+            Ok(CliAction::Login { output_format })
+        }
+        "logout" => {
+            if rest.len() > 1 {
+                return Err(format!(
+                    "unexpected extra arguments after `claw logout`: {}\nUsage: claw logout [--output-format <text|json>]",
+                    rest[1..].join(" ")
+                ));
+            }
+            Ok(CliAction::Logout { output_format })
+        }
+        "dream" => {
+            if rest.len() > 1 {
+                return Err(format!(
+                    "unexpected extra arguments after `claw dream`: {}\nUsage: claw dream [--output-format <text|json>]",
+                    rest[1..].join(" ")
+                ));
+            }
+            Ok(CliAction::Dream { output_format })
+        }
         "init" => {
             // #771: extra positional args to `init` were silently ignored — now rejected
             if rest.len() > 1 {
@@ -1644,13 +1685,6 @@ fn compact_interactive_only_error() -> String {
     // #749: newline before remediation so split_error_hint populates hint field
     "interactive_only: `claw compact` is an interactive/session command.\nStart `claw` and run `/compact`, or use `claw --resume SESSION.jsonl /compact` to compact an existing session."
         .to_string()
-}
-
-fn removed_auth_surface_error(command_name: &str) -> String {
-    // #765: two-line format so split_error_hint() extracts hint into JSON envelope
-    format!(
-        "`claw {command_name}` has been removed.\nSet ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead."
-    )
 }
 
 fn unexpected_diff_args_error(extra: &[String]) -> String {
@@ -2753,55 +2787,63 @@ fn check_auth_health() -> DiagnosticCheck {
     );
 
     match load_oauth_credentials() {
-        Ok(Some(token_set)) => DiagnosticCheck::new(
-            "Auth",
-            if any_auth_present {
-                DiagnosticLevel::Ok
-            } else {
-                DiagnosticLevel::Warn
-            },
-            if any_auth_present {
-                "supported auth env vars are configured; legacy saved OAuth is ignored"
-            } else {
-                "legacy saved OAuth credentials are present but unsupported"
-            },
-        )
-        .with_details(vec![
-            env_details,
-            format!(
-                "Legacy OAuth      expires_at={} refresh_token={} scopes={}",
-                token_set
-                    .expires_at
-                    .map_or_else(|| "<none>".to_string(), |value| value.to_string()),
-                if token_set.refresh_token.is_some() {
-                    "present"
+        Ok(Some(token_set)) => {
+            // A saved Claude subscription token (from `claw login`) is a
+            // supported, explicit, lowest-priority auth source: it is used only
+            // when no env auth is present, and is auto-refreshed at startup.
+            DiagnosticCheck::new(
+                "Auth",
+                DiagnosticLevel::Ok,
+                if any_auth_present {
+                    "auth env vars are configured; a saved subscription token is also present (env wins)"
                 } else {
-                    "absent"
+                    "a saved Claude subscription token is present and will be used"
                 },
-                if token_set.scopes.is_empty() {
-                    "<none>".to_string()
-                } else {
-                    token_set.scopes.join(",")
-                }
-            ),
-            "Suggested action  set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN; `claw login` is removed"
-                .to_string(),
-        ])
-        .with_hint("Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN env var. The saved OAuth token is no longer accepted.")
-        .with_data(Map::from_iter([
-            ("api_key_present".to_string(), json!(api_key_present)),
-            ("auth_token_present".to_string(), json!(auth_token_present)),
-            ("legacy_saved_oauth_present".to_string(), json!(true)),
-            (
-                "legacy_saved_oauth_expires_at".to_string(),
-                json!(token_set.expires_at),
-            ),
-            (
-                "legacy_refresh_token_present".to_string(),
-                json!(token_set.refresh_token.is_some()),
-            ),
-            ("legacy_scopes".to_string(), json!(token_set.scopes)),
-        ])),
+            )
+            .with_details(vec![
+                env_details,
+                format!(
+                    "Subscription      expires_at={} refresh_token={} scopes={}",
+                    token_set
+                        .expires_at
+                        .map_or_else(|| "<none>".to_string(), |value| value.to_string()),
+                    if token_set.refresh_token.is_some() {
+                        "present"
+                    } else {
+                        "absent"
+                    },
+                    if token_set.scopes.is_empty() {
+                        "<none>".to_string()
+                    } else {
+                        token_set.scopes.join(",")
+                    }
+                ),
+                format!(
+                    "Effective source  {}",
+                    if api_key_present {
+                        "ANTHROPIC_API_KEY"
+                    } else if auth_token_present {
+                        "ANTHROPIC_AUTH_TOKEN"
+                    } else {
+                        "saved subscription token (claw login)"
+                    }
+                ),
+            ])
+            .with_data(Map::from_iter([
+                ("api_key_present".to_string(), json!(api_key_present)),
+                ("auth_token_present".to_string(), json!(auth_token_present)),
+                ("saved_oauth_present".to_string(), json!(true)),
+                (
+                    "saved_oauth_expires_at".to_string(),
+                    json!(token_set.expires_at),
+                ),
+                (
+                    "saved_oauth_refresh_token_present".to_string(),
+                    json!(token_set.refresh_token.is_some()),
+                ),
+                ("saved_oauth_scopes".to_string(), json!(token_set.scopes)),
+            ]))
+        }
         Ok(None) => DiagnosticCheck::new(
             "Auth",
             if any_auth_present {
@@ -2812,33 +2854,33 @@ fn check_auth_health() -> DiagnosticCheck {
             if any_auth_present {
                 "supported auth env vars are configured"
             } else {
-                "no supported auth env vars were found"
+                "no auth configured — set an env var or run `claw login`"
             },
         )
         .with_details(vec![env_details])
-        .with_hint(if !any_auth_present { "Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN to authenticate." } else { "" })
+        .with_hint(if !any_auth_present { "Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN, or run `claw login` to use a Claude subscription." } else { "" })
         .with_data(Map::from_iter([
             ("api_key_present".to_string(), json!(api_key_present)),
             ("auth_token_present".to_string(), json!(auth_token_present)),
-            ("legacy_saved_oauth_present".to_string(), json!(false)),
-            ("legacy_saved_oauth_expires_at".to_string(), Value::Null),
-            ("legacy_refresh_token_present".to_string(), json!(false)),
-            ("legacy_scopes".to_string(), json!(Vec::<String>::new())),
+            ("saved_oauth_present".to_string(), json!(false)),
+            ("saved_oauth_expires_at".to_string(), Value::Null),
+            ("saved_oauth_refresh_token_present".to_string(), json!(false)),
+            ("saved_oauth_scopes".to_string(), json!(Vec::<String>::new())),
         ])),
         Err(error) => DiagnosticCheck::new(
             "Auth",
             DiagnosticLevel::Fail,
-            format!("failed to inspect legacy saved credentials: {error}"),
+            format!("failed to inspect saved credentials: {error}"),
         )
-        .with_hint("Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN env var to authenticate.")
+        .with_hint("Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN, or run `claw login`.")
         .with_data(Map::from_iter([
             ("api_key_present".to_string(), json!(api_key_present)),
             ("auth_token_present".to_string(), json!(auth_token_present)),
-            ("legacy_saved_oauth_present".to_string(), Value::Null),
-            ("legacy_saved_oauth_expires_at".to_string(), Value::Null),
-            ("legacy_refresh_token_present".to_string(), Value::Null),
-            ("legacy_scopes".to_string(), Value::Null),
-            ("legacy_saved_oauth_error".to_string(), json!(error.to_string())),
+            ("saved_oauth_present".to_string(), Value::Null),
+            ("saved_oauth_expires_at".to_string(), Value::Null),
+            ("saved_oauth_refresh_token_present".to_string(), Value::Null),
+            ("saved_oauth_scopes".to_string(), Value::Null),
+            ("saved_oauth_error".to_string(), json!(error.to_string())),
         ])),
     }
 }
@@ -9946,7 +9988,326 @@ fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
 
 #[allow(clippy::result_large_err)]
 fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
-    resolve_startup_auth_source(|| Ok(None))
+    // Env auth wins. The closure supplies the OAuth client config so a saved
+    // `claw login` subscription token can be used as an explicit, lowest-priority
+    // fallback (and auto-refreshed) only when no env auth is present.
+    resolve_startup_auth_source(|| Ok(Some(resolve_oauth_config_for_cwd())))
+}
+
+/// Resolve the OAuth client configuration: a `settings.oauth` override if the
+/// user supplied one, otherwise the built-in Claude subscription defaults.
+fn resolve_oauth_config_for_cwd() -> OAuthConfig {
+    env::current_dir()
+        .ok()
+        .and_then(|cwd| ConfigLoader::default_for(&cwd).load().ok())
+        .and_then(|config| config.oauth().cloned())
+        .unwrap_or_else(OAuthConfig::claude_subscription_default)
+}
+
+/// Run the interactive Claude subscription OAuth login flow: open the browser
+/// to the authorization URL, capture the authorization code (loopback callback
+/// server, falling back to manual paste), exchange it for tokens, and persist
+/// them to `~/.claw/credentials.json`.
+fn run_login(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    let config = resolve_oauth_config_for_cwd();
+    let pkce = generate_pkce_pair()?;
+    let state = generate_state()?;
+    let callback_port = config.callback_port.unwrap_or(DEFAULT_OAUTH_CALLBACK_PORT);
+
+    // Prefer the loopback callback server; fall back to manual paste when the
+    // port cannot be bound (headless/remote shells, port in use, etc.).
+    let listener = TcpListener::bind(("127.0.0.1", callback_port)).ok();
+    let redirect_uri = match &listener {
+        Some(_) => loopback_redirect_uri(callback_port),
+        None => config
+            .manual_redirect_url
+            .clone()
+            .unwrap_or_else(|| runtime::DEFAULT_OAUTH_MANUAL_REDIRECT_URL.to_string()),
+    };
+
+    let authorize_url =
+        OAuthAuthorizationRequest::from_config(&config, &redirect_uri, &state, &pkce).build_url();
+
+    if matches!(output_format, CliOutputFormat::Text) {
+        println!("Opening your browser to sign in to your Claude subscription...");
+        println!("If it does not open, visit this URL manually:\n\n{authorize_url}\n");
+    }
+    try_open_browser(&authorize_url);
+
+    // Capture the authorization code + state.
+    let (code, returned_state) = match &listener {
+        Some(listener) => {
+            match capture_oauth_code_via_loopback(listener, Duration::from_secs(300)) {
+                Ok(params) => resolve_callback_code(params, &state)?,
+                Err(error) => {
+                    if matches!(output_format, CliOutputFormat::Text) {
+                        eprintln!("Loopback callback unavailable ({error}); falling back to manual entry.");
+                    }
+                    (prompt_for_manual_oauth_code()?, state.clone())
+                }
+            }
+        }
+        None => split_manual_code(&prompt_for_manual_oauth_code()?, &state),
+    };
+
+    if returned_state != state {
+        return Err(
+            "OAuth state mismatch — aborting login (possible CSRF or stale callback)".into(),
+        );
+    }
+
+    let exchange = OAuthTokenExchangeRequest::from_config(
+        &config,
+        code,
+        returned_state,
+        pkce.verifier.clone(),
+        redirect_uri,
+    );
+    let client = AnthropicClient::from_auth(AuthSource::None);
+    let runtime = tokio::runtime::Runtime::new()?;
+    let tokens = runtime.block_on(client.exchange_oauth_code(&config, &exchange))?;
+
+    save_oauth_credentials(&OAuthTokenSet {
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+        expires_at: tokens.expires_at,
+        scopes: tokens.scopes.clone(),
+    })?;
+
+    match output_format {
+        CliOutputFormat::Text => {
+            println!(
+                "Logged in. Your Claude subscription token is saved to ~/.claw/credentials.json."
+            );
+            println!("It will be used automatically when no ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN is set.");
+        }
+        CliOutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "status": "logged_in",
+                    "credentials_path": "~/.claw/credentials.json",
+                    "scopes": tokens.scopes,
+                }))?
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Clear the saved Claude subscription OAuth credentials.
+fn run_logout(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    let had_credentials = load_oauth_credentials()?.is_some();
+    clear_oauth_credentials()?;
+    match output_format {
+        CliOutputFormat::Text => {
+            if had_credentials {
+                println!("Logged out. Saved Claude subscription token removed.");
+            } else {
+                println!("No saved Claude subscription token was present.");
+            }
+        }
+        CliOutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "status": "logged_out",
+                    "had_credentials": had_credentials,
+                }))?
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `claw dream`: distill recent journal entries into durable memories.
+///
+/// The model call is the only non-local step. It is routed through the same
+/// subscription-auth path as the rest of the CLI (`resolve_cli_auth_source`),
+/// so a `claw login` token is used when present. This adapter is deliberately
+/// thin: `runtime::run_dream` owns all the prompt/parse/write logic and is
+/// fully unit-tested with a mock completer — here we only translate the model
+/// reply into the plain string the seam expects. Dream never runs implicitly;
+/// it is reachable only via this explicit subcommand.
+fn run_dream_command(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    let model = ModelProvenance::from_env_or_config_or_default(DEFAULT_MODEL).resolved;
+    let max_tokens = max_tokens_for_model(&model);
+
+    let completer = |prompt: &str| -> io::Result<String> {
+        let auth =
+            resolve_cli_auth_source().map_err(|error| io::Error::other(error.to_string()))?;
+        let client = AnthropicClient::from_auth(auth).with_base_url(api::read_base_url());
+        let request = MessageRequest {
+            model: model.clone(),
+            max_tokens,
+            messages: vec![InputMessage::user_text(prompt)],
+            system: Some(
+                "You distill an agent's raw journal into durable memories. Follow the output \
+format exactly."
+                    .to_string(),
+            ),
+            stream: false,
+            ..Default::default()
+        };
+        let runtime = tokio::runtime::Runtime::new()?;
+        let response = runtime
+            .block_on(client.send_message(&request))
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let text = response
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                OutputContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        Ok(text)
+    };
+
+    let outcome = runtime::run_dream(
+        runtime::JournalDate::today_utc(),
+        &runtime::DreamOptions::default(),
+        completer,
+    )?;
+
+    match output_format {
+        CliOutputFormat::Text => {
+            if let Some(note) = &outcome.note {
+                println!(
+                    "Dream: {note} ({} days considered).",
+                    outcome.days_considered
+                );
+            } else {
+                println!(
+                    "Dream complete: {} memories written from {} day(s); {} block(s) skipped.",
+                    outcome.memories_written, outcome.days_considered, outcome.skipped_blocks
+                );
+                for file in &outcome.files {
+                    println!("  {}", file.display());
+                }
+            }
+        }
+        CliOutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "status": if outcome.marker_advanced { "dreamed" } else { "noop" },
+                    "days_considered": outcome.days_considered,
+                    "memories_written": outcome.memories_written,
+                    "skipped_blocks": outcome.skipped_blocks,
+                    "marker_advanced": outcome.marker_advanced,
+                    "files": outcome.files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                    "note": outcome.note,
+                }))?
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Best-effort browser launch. Failure is non-fatal: the URL was already
+/// printed so the user can open it manually.
+fn try_open_browser(url: &str) {
+    let mut command = if cfg!(target_os = "macos") {
+        let mut c = std::process::Command::new("open");
+        c.arg(url);
+        c
+    } else if cfg!(target_os = "windows") {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", "", url]);
+        c
+    } else {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    let _ = command
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// Block on a single loopback HTTP callback and return its parsed parameters.
+fn capture_oauth_code_via_loopback(
+    listener: &TcpListener,
+    timeout: Duration,
+) -> Result<OAuthCallbackParams, String> {
+    use std::io::{BufRead, BufReader, Write};
+
+    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match listener.accept() {
+            Ok((stream, _addr)) => {
+                let mut request_line = String::new();
+                {
+                    let mut reader = BufReader::new(&stream);
+                    reader
+                        .read_line(&mut request_line)
+                        .map_err(|e| e.to_string())?;
+                }
+                // "GET /callback?code=...&state=... HTTP/1.1"
+                let target = request_line.split_whitespace().nth(1).unwrap_or("");
+                let params = parse_oauth_callback_request_target(target)?;
+                let body = "<html><body><h2>Login complete.</h2>You can close this tab and return to the terminal.</body></html>";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = (&stream).write_all(response.as_bytes());
+                let _ = (&stream).flush();
+                return Ok(params);
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err("timed out waiting for the OAuth callback".to_string());
+                }
+                thread::sleep(Duration::from_millis(150));
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+/// Validate a loopback callback and extract (code, state).
+fn resolve_callback_code(
+    params: OAuthCallbackParams,
+    expected_state: &str,
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    if let Some(error) = params.error {
+        let description = params.error_description.unwrap_or_default();
+        return Err(format!("OAuth provider returned an error: {error} {description}").into());
+    }
+    let code = params
+        .code
+        .ok_or("OAuth callback did not include an authorization code")?;
+    let state = params.state.unwrap_or_else(|| expected_state.to_string());
+    Ok((code, state))
+}
+
+/// Prompt the user to paste the authorization code (manual-paste fallback).
+fn prompt_for_manual_oauth_code() -> Result<String, Box<dyn std::error::Error>> {
+    use std::io::Write;
+    print!("Paste the authorization code shown after sign-in: ");
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let code = line.trim().to_string();
+    if code.is_empty() {
+        return Err("no authorization code entered".into());
+    }
+    Ok(code)
+}
+
+/// The console manual-paste flow returns a `code#state` value. Split it; if no
+/// `#` is present, keep the locally generated state.
+fn split_manual_code(pasted: &str, fallback_state: &str) -> (String, String) {
+    match pasted.split_once('#') {
+        Some((code, state)) => (code.to_string(), state.to_string()),
+        None => (pasted.to_string(), fallback_state.to_string()),
+    }
 }
 
 impl ApiClient for AnthropicRuntimeClient {
@@ -10372,8 +10733,6 @@ fn collect_prompt_cache_events(summary: &runtime::TurnSummary) -> Vec<serde_json
 /// in this build. Used to filter both REPL completions and help output so the
 /// discovery surface only shows commands that actually work (ROADMAP #39).
 const STUB_COMMANDS: &[&str] = &[
-    "login",
-    "logout",
     "vim",
     "upgrade",
     "share",
@@ -11355,6 +11714,18 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "      Diagnose local auth, config, workspace, and sandbox health"
     )?;
+    writeln!(out, "  claw login")?;
+    writeln!(
+        out,
+        "      Sign in with a Claude subscription (OAuth); saves a token to ~/.claw/credentials.json"
+    )?;
+    writeln!(out, "  claw logout")?;
+    writeln!(out, "      Remove the saved Claude subscription token")?;
+    writeln!(out, "  claw dream")?;
+    writeln!(
+        out,
+        "      Distill recent journal entries into durable memories under ~/.claw/memory"
+    )?;
     writeln!(out, "  claw acp [serve]")?;
     writeln!(
         out,
@@ -11930,7 +12301,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_cli_auth_source_ignores_saved_oauth_credentials() {
+    fn resolve_cli_auth_source_uses_saved_oauth_when_env_absent() {
         let _guard = env_lock();
         let config_home = temp_dir();
         std::fs::create_dir_all(&config_home).expect("config home should exist");
@@ -11942,16 +12313,27 @@ mod tests {
         std::env::remove_var("ANTHROPIC_API_KEY");
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
 
+        // Non-expired token => no refresh network call; it should be used as the
+        // explicit lowest-priority auth source.
         save_oauth_credentials(&runtime::OAuthTokenSet {
-            access_token: "expired-access-token".to_string(),
+            access_token: "saved-subscription-token".to_string(),
             refresh_token: Some("refresh-token".to_string()),
-            expires_at: Some(0),
-            scopes: vec!["org:create_api_key".to_string(), "user:profile".to_string()],
+            expires_at: Some(
+                std::time::SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+                    + 3600,
+            ),
+            scopes: vec![
+                "org:create_api_key".to_string(),
+                "user:inference".to_string(),
+            ],
         })
-        .expect("save expired oauth credentials");
+        .expect("save oauth credentials");
 
-        let error = super::resolve_cli_auth_source_for_cwd()
-            .expect_err("saved oauth should be ignored without env auth");
+        let auth = super::resolve_cli_auth_source_for_cwd()
+            .expect("saved oauth should resolve when no env auth is present");
 
         match original_config_home {
             Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
@@ -11967,7 +12349,8 @@ mod tests {
         }
         std::fs::remove_dir_all(config_home).expect("temp config home should clean up");
 
-        assert!(error.to_string().contains("ANTHROPIC_API_KEY"));
+        assert!(auth.is_oauth_subscription());
+        assert_eq!(auth.bearer_token(), Some("saved-subscription-token"));
     }
 
     #[test]
@@ -12391,11 +12774,33 @@ mod tests {
     }
 
     #[test]
-    fn removed_login_and_logout_subcommands_error_helpfully() {
-        let login = parse_args(&["login".to_string()]).expect_err("login should be removed");
-        assert!(login.contains("ANTHROPIC_API_KEY"));
-        let logout = parse_args(&["logout".to_string()]).expect_err("logout should be removed");
-        assert!(logout.contains("ANTHROPIC_AUTH_TOKEN"));
+    fn login_and_logout_subcommands_parse_to_actions() {
+        assert_eq!(
+            parse_args(&["login".to_string()]).expect("login should parse"),
+            CliAction::Login {
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&["logout".to_string()]).expect("logout should parse"),
+            CliAction::Logout {
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        // `dream` is reachable only as an explicit subcommand.
+        assert_eq!(
+            parse_args(&["dream".to_string()]).expect("dream should parse"),
+            CliAction::Dream {
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert!(parse_args(&["dream".to_string(), "extra".to_string()])
+            .expect_err("dream extra args should be rejected")
+            .contains("unexpected extra arguments"));
+        // Extra positionals are rejected.
+        assert!(parse_args(&["login".to_string(), "extra".to_string()])
+            .expect_err("extra args should be rejected")
+            .contains("unexpected extra arguments"));
         assert_eq!(
             parse_args(&["doctor".to_string()]).expect("doctor should parse"),
             CliAction::Doctor {
@@ -14549,8 +14954,8 @@ mod tests {
         assert!(help.contains("claw /skills"));
         assert!(help.contains("ultraworkers/claw-code"));
         assert!(help.contains("cargo install claw-code"));
-        assert!(!help.contains("claw login"));
-        assert!(!help.contains("claw logout"));
+        assert!(help.contains("claw login"));
+        assert!(help.contains("claw logout"));
     }
 
     #[test]

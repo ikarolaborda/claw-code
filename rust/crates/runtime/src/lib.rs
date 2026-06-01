@@ -13,11 +13,13 @@ mod compact;
 mod config;
 pub mod config_validate;
 mod conversation;
+mod dream;
 mod file_ops;
 pub mod g004_conformance;
 mod git_context;
 pub mod green_contract;
 mod hooks;
+mod journal;
 mod json;
 mod lane_events;
 pub mod lsp_client;
@@ -71,6 +73,8 @@ pub use config::{
     McpWebSocketServerConfig, OAuthConfig, ProviderFallbackConfig, ResolvedPermissionMode,
     RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig, RuntimePermissionRuleConfig,
     RuntimePluginConfig, ScopedMcpServerConfig, CLAW_SETTINGS_SCHEMA_NAME,
+    DEFAULT_OAUTH_AUTHORIZE_URL, DEFAULT_OAUTH_CLIENT_ID, DEFAULT_OAUTH_MANUAL_REDIRECT_URL,
+    DEFAULT_OAUTH_TOKEN_URL,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
@@ -81,6 +85,10 @@ pub use conversation::{
     ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolError,
     ToolExecutor, TurnSummary,
 };
+pub use dream::{
+    build_distill_prompt, memory_root, parse_distilled, read_last_dream, run_dream, slugify,
+    write_distilled, DistilledMemory, DreamOptions, DreamOutcome, ParseResult,
+};
 pub use file_ops::{
     edit_file, edit_file_in_workspace, glob_search, glob_search_in_workspace, grep_search,
     grep_search_in_workspace, read_file, read_file_in_workspace, write_file,
@@ -90,6 +98,10 @@ pub use file_ops::{
 pub use git_context::{GitCommitEntry, GitContext};
 pub use hooks::{
     HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter, HookRunResult, HookRunner,
+};
+pub use journal::{
+    append_entry, append_entry_on, journal_path_for, journal_root, list_journal_days, read_day,
+    JournalDate,
 };
 pub use lane_events::{
     compute_event_fingerprint, dedupe_superseded_commit_events, dedupe_terminal_events,

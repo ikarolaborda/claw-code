@@ -271,6 +271,11 @@ fn a2_api_key_only_uses_x_api_key_without_oauth_markers() {
         req.headers
     );
     assert!(
+        req.headers.get("authorization").is_none(),
+        "api-key auth must not send a bearer authorization; headers: {:?}",
+        req.headers
+    );
+    assert!(
         !has_oauth_markers(req),
         "api-key traffic must NOT carry the oauth beta or identity; headers: {:?} body: {}",
         req.headers,
@@ -305,10 +310,10 @@ fn a2_api_key_wins_over_saved_oauth_and_no_marker_leak() {
         "env API key must win over a saved OAuth token; headers: {:?}",
         req.headers
     );
-    assert_ne!(
-        req.headers.get("authorization").map(String::as_str),
-        Some("Bearer saved-but-ignored"),
-        "the saved OAuth token must not be used when an API key is present"
+    assert!(
+        req.headers.get("authorization").is_none(),
+        "the saved OAuth token must not leak as a bearer when an API key is present; headers: {:?}",
+        req.headers
     );
     assert!(
         !has_oauth_markers(req),
@@ -402,9 +407,10 @@ fn a3_expired_token_is_refreshed_persisted_and_new_bearer_used() {
     assert_ok(&output);
 
     let captured = runtime.block_on(server.captured_requests());
-    assert!(
-        captured.iter().any(|r| r.path == "/oauth/token"),
-        "the expired token must trigger a refresh at the token endpoint; captured: {captured:?}"
+    let token_hits = captured.iter().filter(|r| r.path == "/oauth/token").count();
+    assert_eq!(
+        token_hits, 1,
+        "the expired token must trigger exactly one refresh; captured: {captured:?}"
     );
     let messages = messages_of(&captured);
     assert_eq!(messages.len(), 1, "exactly one /v1/messages request");
@@ -464,6 +470,16 @@ fn a3_refresh_failure_aborts_without_sending_messages() {
     assert!(
         messages_of(&captured).is_empty(),
         "no model request should be sent after a failed refresh; captured: {captured:?}"
+    );
+    // A failed refresh must not corrupt the stored credential.
+    let creds: Value = serde_json::from_str(
+        &fs::read_to_string(ws.config_home.join("credentials.json")).expect("read creds"),
+    )
+    .expect("creds json");
+    assert_eq!(
+        creds["oauth"]["accessToken"].as_str(),
+        Some("expired-access"),
+        "a failed refresh must not overwrite the stored token; creds: {creds}"
     );
 
     fs::remove_dir_all(&ws.root).ok();

@@ -106,6 +106,9 @@ enum Scenario {
     AutoCompactTriggered,
     TokenCostReporting,
     DreamDistill,
+    BashBackgroundRoundtrip,
+    TaskCreateLifecycle,
+    BriefProactiveAccepted,
 }
 
 impl Scenario {
@@ -124,6 +127,9 @@ impl Scenario {
             "auto_compact_triggered" => Some(Self::AutoCompactTriggered),
             "token_cost_reporting" => Some(Self::TokenCostReporting),
             "dream_distill" => Some(Self::DreamDistill),
+            "bash_background_roundtrip" => Some(Self::BashBackgroundRoundtrip),
+            "task_create_lifecycle" => Some(Self::TaskCreateLifecycle),
+            "brief_proactive_accepted" => Some(Self::BriefProactiveAccepted),
             _ => None,
         }
     }
@@ -143,6 +149,9 @@ impl Scenario {
             Self::AutoCompactTriggered => "auto_compact_triggered",
             Self::TokenCostReporting => "token_cost_reporting",
             Self::DreamDistill => "dream_distill",
+            Self::BashBackgroundRoundtrip => "bash_background_roundtrip",
+            Self::TaskCreateLifecycle => "task_create_lifecycle",
+            Self::BriefProactiveAccepted => "brief_proactive_accepted",
         }
     }
 }
@@ -537,6 +546,39 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
         // `claw dream` always sends `stream: false`; this arm exists only to keep
         // the match exhaustive and stays consistent with the non-streaming reply.
         Scenario::DreamDistill => final_text_sse(DREAM_DISTILL_REPLY),
+        // Kairos B1 (shipped surface): background execution is exposed through the
+        // `bash` tool's `run_in_background`. The command writes a marker file and
+        // exits, so the test can prove the subprocess ran and left no orphan.
+        Scenario::BashBackgroundRoundtrip => match latest_tool_result(request) {
+            Some(_) => final_text_sse("background bash launched"),
+            None => tool_use_sse(
+                "toolu_bash_background",
+                "bash",
+                &[r#"{"command":"printf done > kairos_bg_marker.txt","run_in_background":true}"#],
+            ),
+        },
+        // `TaskCreate` is registry bookkeeping only (status `created`); it does not
+        // execute the prompt — the worker/lane execution engine is not built.
+        Scenario::TaskCreateLifecycle => match latest_tool_result(request) {
+            Some(_) => final_text_sse("task registered"),
+            None => tool_use_sse(
+                "toolu_task_create",
+                "TaskCreate",
+                &[
+                    r#"{"prompt":"summarize parity coverage","description":"kairos b1 registry probe"}"#,
+                ],
+            ),
+        },
+        // `SendUserMessage`/`Brief` accepts `status: proactive` as valid input; the
+        // shipped tool treats normal|proactive identically (no routing difference).
+        Scenario::BriefProactiveAccepted => match latest_tool_result(request) {
+            Some(_) => final_text_sse("brief accepted"),
+            None => tool_use_sse(
+                "toolu_brief_proactive",
+                "SendUserMessage",
+                &[r#"{"message":"kairos proactive note","status":"proactive"}"#],
+            ),
+        },
     }
 }
 
@@ -708,6 +750,33 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
             1_000,
             500,
         ),
+        Scenario::BashBackgroundRoundtrip => match latest_tool_result(request) {
+            Some(_) => text_message_response("msg_bash_bg_final", "background bash launched"),
+            None => tool_message_response(
+                "msg_bash_bg_tool",
+                "toolu_bash_background",
+                "bash",
+                json!({"command": "printf done > kairos_bg_marker.txt", "run_in_background": true}),
+            ),
+        },
+        Scenario::TaskCreateLifecycle => match latest_tool_result(request) {
+            Some(_) => text_message_response("msg_task_create_final", "task registered"),
+            None => tool_message_response(
+                "msg_task_create_tool",
+                "toolu_task_create",
+                "TaskCreate",
+                json!({"prompt": "summarize parity coverage", "description": "kairos b1 registry probe"}),
+            ),
+        },
+        Scenario::BriefProactiveAccepted => match latest_tool_result(request) {
+            Some(_) => text_message_response("msg_brief_proactive_final", "brief accepted"),
+            None => tool_message_response(
+                "msg_brief_proactive_tool",
+                "toolu_brief_proactive",
+                "SendUserMessage",
+                json!({"message": "kairos proactive note", "status": "proactive"}),
+            ),
+        },
     }
 }
 
@@ -726,6 +795,9 @@ fn request_id_for(scenario: Scenario) -> &'static str {
         Scenario::PluginToolRoundtrip => "req_plugin_tool_roundtrip",
         Scenario::AutoCompactTriggered => "req_auto_compact_triggered",
         Scenario::TokenCostReporting => "req_token_cost_reporting",
+        Scenario::BashBackgroundRoundtrip => "req_bash_background_roundtrip",
+        Scenario::TaskCreateLifecycle => "req_task_create_lifecycle",
+        Scenario::BriefProactiveAccepted => "req_brief_proactive_accepted",
     }
 }
 

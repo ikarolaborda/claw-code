@@ -6339,7 +6339,7 @@ impl LiveCli {
         let previous = self.model.clone();
         let session = self.runtime.session().clone();
         let message_count = session.messages.len();
-        let runtime = build_runtime(
+        let runtime = match build_runtime(
             session,
             &self.session.id,
             model.clone(),
@@ -6349,7 +6349,15 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
-        )?;
+        ) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                // A failed rebuild must not tear down the REPL. Keep the current
+                // model and runtime, surface why, and let the session continue.
+                eprintln!("model switch to `{model}` failed; keeping `{previous}`: {error}");
+                return Ok(false);
+            }
+        };
         self.replace_runtime(runtime)?;
         self.model.clone_from(&model);
         println!(
@@ -6383,9 +6391,12 @@ impl LiveCli {
         }
 
         let previous = self.permission_mode.as_str().to_string();
+        let candidate = permission_mode_from_label(normalized);
         let session = self.runtime.session().clone();
-        self.permission_mode = permission_mode_from_label(normalized);
-        let runtime = build_runtime(
+        // Build against the candidate mode WITHOUT mutating self first, so a
+        // failed rebuild leaves permission_mode and runtime consistent and does
+        // not tear down the REPL.
+        let runtime = match build_runtime(
             session,
             &self.session.id,
             self.model.clone(),
@@ -6393,10 +6404,19 @@ impl LiveCli {
             true,
             true,
             self.allowed_tools.clone(),
-            self.permission_mode,
+            candidate,
             None,
-        )?;
+        ) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                eprintln!(
+                    "permission switch to `{normalized}` failed; keeping `{previous}`: {error}"
+                );
+                return Ok(false);
+            }
+        };
         self.replace_runtime(runtime)?;
+        self.permission_mode = candidate;
         println!(
             "{}",
             format_permissions_switch_report(&previous, normalized)

@@ -16,9 +16,7 @@
 use std::io;
 
 use serde_json::{json, Value as JsonValue};
-use tokio::io::{
-    stdin, stdout, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Stdin, Stdout,
-};
+use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncWriteExt, BufReader, Stdin, Stdout};
 
 use crate::mcp_stdio::{
     JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse, McpInitializeResult,
@@ -242,57 +240,43 @@ fn invalid_params_response(id: JsonRpcId, message: &str) -> JsonRpcResponse<Json
     }
 }
 
-/// Reads a single LSP-framed JSON-RPC payload from `reader`.
+/// Reads a single NDJSON-framed JSON-RPC message from `reader`.
 ///
-/// Returns `Ok(None)` on clean EOF before any header bytes have been read,
-/// matching how [`crate::mcp_stdio::McpStdioProcess`] treats stream closure.
+/// MCP stdio transport delimits messages by newline (one compact JSON object per
+/// line), not LSP `Content-Length` headers. Blank/whitespace-only lines are
+/// skipped as separators. Returns `Ok(None)` on clean EOF before any message
+/// bytes have been read, matching how [`crate::mcp_stdio::McpStdioProcess`]
+/// treats stream closure.
 async fn read_frame(reader: &mut BufReader<Stdin>) -> io::Result<Option<Vec<u8>>> {
-    let mut content_length: Option<usize> = None;
-    let mut first_header = true;
+    let mut read_any = false;
     loop {
         let mut line = String::new();
         let bytes_read = reader.read_line(&mut line).await?;
         if bytes_read == 0 {
-            if first_header {
-                return Ok(None);
+            if read_any {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "MCP stdio stream closed while reading message",
+                ));
             }
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "MCP stdio stream closed while reading headers",
-            ));
+            return Ok(None);
         }
-        first_header = false;
-        if line == "\r\n" || line == "\n" {
-            break;
+        let message = line.trim_end_matches(['\r', '\n']);
+        if message.trim().is_empty() {
+            read_any = true;
+            continue;
         }
-        let header = line.trim_end_matches(['\r', '\n']);
-        if let Some((name, value)) = header.split_once(':') {
-            if name.trim().eq_ignore_ascii_case("Content-Length") {
-                let parsed = value
-                    .trim()
-                    .parse::<usize>()
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                content_length = Some(parsed);
-            }
-        }
+        return Ok(Some(message.as_bytes().to_vec()));
     }
-
-    let content_length = content_length.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
-    })?;
-    let mut payload = vec![0_u8; content_length];
-    reader.read_exact(&mut payload).await?;
-    Ok(Some(payload))
 }
 
 async fn write_response(
     stdout: &mut Stdout,
     response: &JsonRpcResponse<JsonValue>,
 ) -> io::Result<()> {
-    let body = serde_json::to_vec(response)
+    let mut body = serde_json::to_vec(response)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let header = format!("Content-Length: {}\r\n\r\n", body.len());
-    stdout.write_all(header.as_bytes()).await?;
+    body.push(b'\n');
     stdout.write_all(&body).await?;
     stdout.flush().await
 }

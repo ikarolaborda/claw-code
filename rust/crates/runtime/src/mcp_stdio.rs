@@ -1233,37 +1233,25 @@ impl McpStdioProcess {
     }
 
     pub async fn read_frame(&mut self) -> io::Result<Vec<u8>> {
-        let mut content_length = None;
+        // NDJSON: one JSON-RPC message per line. Blank/whitespace-only lines are
+        // tolerated as separators and skipped; any other line is handed to the
+        // JSON parser as-is. Non-JSON content is NOT silently dropped — it fails
+        // fast at deserialize, surfacing a misbehaving server rather than hanging.
         loop {
             let mut line = String::new();
             let bytes_read = self.stdout.read_line(&mut line).await?;
             if bytes_read == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    "MCP stdio stream closed while reading headers",
+                    "MCP stdio stream closed while reading message",
                 ));
             }
-            if line == "\r\n" {
-                break;
+            let message = line.trim_end_matches(['\r', '\n']);
+            if message.trim().is_empty() {
+                continue;
             }
-            let header = line.trim_end_matches(['\r', '\n']);
-            if let Some((name, value)) = header.split_once(':') {
-                if name.trim().eq_ignore_ascii_case("Content-Length") {
-                    let parsed = value
-                        .trim()
-                        .parse::<usize>()
-                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                    content_length = Some(parsed);
-                }
-            }
+            return Ok(message.as_bytes().to_vec());
         }
-
-        let content_length = content_length.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
-        })?;
-        let mut payload = vec![0_u8; content_length];
-        self.stdout.read_exact(&mut payload).await?;
-        Ok(payload)
     }
 
     pub async fn write_jsonrpc_message<T: Serialize>(&mut self, message: &T) -> io::Result<()> {
@@ -1408,9 +1396,14 @@ fn apply_env(command: &mut Command, env: &BTreeMap<String, String>) {
 }
 
 fn encode_frame(payload: &[u8]) -> Vec<u8> {
-    let header = format!("Content-Length: {}\r\n\r\n", payload.len());
-    let mut framed = header.into_bytes();
+    // MCP stdio transport frames each JSON-RPC message as a single line of
+    // newline-delimited JSON (NDJSON), not LSP-style `Content-Length` headers.
+    // `payload` is always compact `serde_json::to_vec` output, so it contains no
+    // embedded raw newlines (newlines inside strings are escaped as `\n`); we
+    // only append the single delimiting newline.
+    let mut framed = Vec::with_capacity(payload.len() + 1);
     framed.extend_from_slice(payload);
+    framed.push(b'\n');
     framed
 }
 
@@ -1485,24 +1478,13 @@ mod tests {
         let script = [
             "#!/usr/bin/env python3",
             "import json, os, sys",
-            "LOWERCASE_CONTENT_LENGTH = os.environ.get('MCP_LOWERCASE_CONTENT_LENGTH') == '1'",
+            "BLANK_LINES = int(os.environ.get('MCP_EMIT_BLANK_LINES', '0'))",
             "MISMATCHED_RESPONSE_ID = os.environ.get('MCP_MISMATCHED_RESPONSE_ID') == '1'",
-            "header = b''",
-            r"while not header.endswith(b'\r\n\r\n'):",
-            "    chunk = sys.stdin.buffer.read(1)",
-            "    if not chunk:",
-            "        raise SystemExit(1)",
-            "    header += chunk",
-            "length = 0",
-            r"for line in header.decode().split('\r\n'):",
-            r"    if line.lower().startswith('content-length:'):",
-            r"        length = int(line.split(':', 1)[1].strip())",
-            "payload = sys.stdin.buffer.read(length)",
-            "request = json.loads(payload.decode())",
+            "line = sys.stdin.buffer.readline()",
+            "request = json.loads(line.decode())",
             r"assert request['jsonrpc'] == '2.0'",
             r"assert request['method'] == 'initialize'",
             "response_id = 'wrong-id' if MISMATCHED_RESPONSE_ID else request['id']",
-            "header_name = 'content-length' if LOWERCASE_CONTENT_LENGTH else 'Content-Length'",
             r"response = json.dumps({",
             r"    'jsonrpc': '2.0',",
             r"    'id': response_id,",
@@ -1512,7 +1494,7 @@ mod tests {
             r"        'serverInfo': {'name': 'fake-mcp', 'version': '0.1.0'}",
             r"    }",
             r"}).encode()",
-            r"sys.stdout.buffer.write(f'{header_name}: {len(response)}\r\n\r\n'.encode() + response)",
+            r"sys.stdout.buffer.write(b'\r\n' * BLANK_LINES + response + b'\n')",
             "sys.stdout.buffer.flush()",
             "",
         ]
@@ -1536,22 +1518,16 @@ mod tests {
             "INVALID_TOOL_CALL_RESPONSE = os.environ.get('MCP_INVALID_TOOL_CALL_RESPONSE') == '1'",
             "",
             "def read_message():",
-            "    header = b''",
-            r"    while not header.endswith(b'\r\n\r\n'):",
-            "        chunk = sys.stdin.buffer.read(1)",
-            "        if not chunk:",
+            "    while True:",
+            "        line = sys.stdin.buffer.readline()",
+            "        if not line:",
             "            return None",
-            "        header += chunk",
-            "    length = 0",
-            r"    for line in header.decode().split('\r\n'):",
-            r"        if line.lower().startswith('content-length:'):",
-            r"            length = int(line.split(':', 1)[1].strip())",
-            "    payload = sys.stdin.buffer.read(length)",
-            "    return json.loads(payload.decode())",
+            "        line = line.strip()",
+            "        if line:",
+            "            return json.loads(line.decode())",
             "",
             "def send_message(message):",
-            "    payload = json.dumps(message).encode()",
-            r"    sys.stdout.buffer.write(f'Content-Length: {len(payload)}\r\n\r\n'.encode() + payload)",
+            "    sys.stdout.buffer.write(json.dumps(message).encode() + b'\\n')",
             "    sys.stdout.buffer.flush()",
             "",
             "while True:",
@@ -1589,7 +1565,7 @@ mod tests {
             "        })",
             "    elif method == 'tools/call':",
             "        if INVALID_TOOL_CALL_RESPONSE:",
-            "            sys.stdout.buffer.write(b'Content-Length: 5\\r\\n\\r\\nnope!')",
+            "            sys.stdout.buffer.write(b'nope!\\n')",
             "            sys.stdout.buffer.flush()",
             "            continue",
             "        if TOOL_CALL_DELAY_MS:",
@@ -1689,22 +1665,16 @@ mod tests {
             "    return True",
             "",
             "def read_message():",
-            "    header = b''",
-            r"    while not header.endswith(b'\r\n\r\n'):",
-            "        chunk = sys.stdin.buffer.read(1)",
-            "        if not chunk:",
+            "    while True:",
+            "        line = sys.stdin.buffer.readline()",
+            "        if not line:",
             "            return None",
-            "        header += chunk",
-            "    length = 0",
-            r"    for line in header.decode().split('\r\n'):",
-            r"        if line.lower().startswith('content-length:'):",
-            r"            length = int(line.split(':', 1)[1].strip())",
-            "    payload = sys.stdin.buffer.read(length)",
-            "    return json.loads(payload.decode())",
+            "        line = line.strip()",
+            "        if line:",
+            "            return json.loads(line.decode())",
             "",
             "def send_message(message):",
-            "    payload = json.dumps(message).encode()",
-            r"    sys.stdout.buffer.write(f'Content-Length: {len(payload)}\r\n\r\n'.encode() + payload)",
+            "    sys.stdout.buffer.write(json.dumps(message).encode() + b'\\n')",
             "    sys.stdout.buffer.flush()",
             "",
             "while True:",
@@ -1955,7 +1925,7 @@ mod tests {
     }
 
     #[test]
-    fn write_jsonrpc_request_emits_content_length_frame() {
+    fn write_jsonrpc_request_emits_ndjson_frame() {
         let runtime = Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1989,7 +1959,7 @@ mod tests {
     }
 
     #[test]
-    fn given_lowercase_content_length_when_initialize_then_response_parses() {
+    fn given_leading_blank_lines_when_initialize_then_response_parses() {
         let runtime = Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1998,7 +1968,7 @@ mod tests {
             let script_path = write_jsonrpc_script();
             let transport = script_transport_with_env(
                 &script_path,
-                BTreeMap::from([("MCP_LOWERCASE_CONTENT_LENGTH".to_string(), "1".to_string())]),
+                BTreeMap::from([("MCP_EMIT_BLANK_LINES".to_string(), "2".to_string())]),
             );
             let mut process = McpStdioProcess::spawn(&transport).expect("spawn transport directly");
 
@@ -2018,6 +1988,79 @@ mod tests {
                 .expect("initialize roundtrip");
 
             assert_eq!(response.id, JsonRpcId::Number(8));
+            assert_eq!(response.error, None);
+            assert!(response.result.is_some());
+
+            let status = process.wait().await.expect("wait for exit");
+            assert!(status.success());
+
+            cleanup_script(&script_path);
+        });
+    }
+
+    fn write_strict_ndjson_script() -> PathBuf {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("temp dir");
+        let script_path = root.join("strict-ndjson-mcp.py");
+        let script = [
+            "#!/usr/bin/env python3",
+            "import json, sys",
+            "line = sys.stdin.buffer.readline()",
+            // Strict NDJSON server: the first wire bytes must be a JSON object,
+            // never an LSP `Content-Length:` header. If claw regresses to
+            // Content-Length framing this assertion fails and initialize never
+            // completes -- exactly the serena-breaking bug this test guards.
+            r"assert b'Content-Length' not in line, 'client sent LSP framing'",
+            "request = json.loads(line.decode())",
+            r"assert request['method'] == 'initialize'",
+            r"response = json.dumps({",
+            r"    'jsonrpc': '2.0',",
+            r"    'id': request['id'],",
+            r"    'result': {",
+            r"        'protocolVersion': request['params']['protocolVersion'],",
+            r"        'capabilities': {'tools': {}},",
+            r"        'serverInfo': {'name': 'strict-ndjson', 'version': '1.0.0'}",
+            r"    }",
+            r"}).encode()",
+            r"sys.stdout.buffer.write(response + b'\n')",
+            "sys.stdout.buffer.flush()",
+            "",
+        ]
+        .join("\n");
+        fs::write(&script_path, script).expect("write script");
+        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).expect("chmod");
+        script_path
+    }
+
+    #[test]
+    fn given_strict_ndjson_server_when_initialize_then_roundtrip_succeeds() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_strict_ndjson_script();
+            let transport = script_transport_with_env(&script_path, BTreeMap::new());
+            let mut process = McpStdioProcess::spawn(&transport).expect("spawn transport directly");
+
+            let response = process
+                .initialize(
+                    JsonRpcId::Number(11),
+                    McpInitializeParams {
+                        protocol_version: "2025-03-26".to_string(),
+                        capabilities: json!({"roots": {}}),
+                        client_info: McpInitializeClientInfo {
+                            name: "runtime-tests".to_string(),
+                            version: "0.1.0".to_string(),
+                        },
+                    },
+                )
+                .await
+                .expect("strict NDJSON initialize roundtrip");
+
+            assert_eq!(response.id, JsonRpcId::Number(11));
             assert_eq!(response.error, None);
             assert!(response.result.is_some());
 
@@ -2684,18 +2727,7 @@ mod tests {
         let script = [
             "#!/usr/bin/env python3",
             "import sys",
-            "header = b''",
-            r"while not header.endswith(b'\r\n\r\n'):",
-            "    chunk = sys.stdin.buffer.read(1)",
-            "    if not chunk:",
-            "        raise SystemExit(1)",
-            "    header += chunk",
-            "length = 0",
-            r"for line in header.decode().split('\r\n'):",
-            r"    if line.lower().startswith('content-length:'):",
-            r"        length = int(line.split(':', 1)[1].strip())",
-            "if length:",
-            "    sys.stdin.buffer.read(length)",
+            "sys.stdin.buffer.readline()",
             "raise SystemExit(0)",
             "",
         ]

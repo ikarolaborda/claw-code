@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::io;
 use std::process::Stdio;
@@ -541,23 +541,50 @@ impl McpServerManager {
         self.servers.keys().cloned().collect()
     }
 
+    /// Registers a discovered tool, skipping it when another tool already maps
+    /// to the same MCP-qualified name.
+    ///
+    /// A single server can expose aliases that collapse to one MCP-safe name —
+    /// e.g. qdrant-memory lists both `memory.store` and `memory_store`, and
+    /// [`mcp_tool_name`] normalizes `.` to `_`, so both become
+    /// `mcp__<server>__memory_store`. Keeping the first and skipping the rest
+    /// keeps `discovered_tools` and `tool_index` consistent and stops one
+    /// server's aliasing from aborting the whole CLI at tool registration.
+    fn register_discovered_tool(
+        &mut self,
+        tool: ManagedMcpTool,
+        seen: &mut HashSet<String>,
+        discovered_tools: &mut Vec<ManagedMcpTool>,
+    ) {
+        if !seen.insert(tool.qualified_name.clone()) {
+            eprintln!(
+                "claw: MCP server `{}` exposes a duplicate tool name `{}` (from `{}`); keeping the first and skipping this alias",
+                tool.server_name, tool.qualified_name, tool.raw_name
+            );
+            return;
+        }
+
+        self.tool_index.insert(
+            tool.qualified_name.clone(),
+            ToolRoute {
+                server_name: tool.server_name.clone(),
+                raw_name: tool.raw_name.clone(),
+            },
+        );
+        discovered_tools.push(tool);
+    }
+
     pub async fn discover_tools(&mut self) -> Result<Vec<ManagedMcpTool>, McpServerManagerError> {
         let server_names = self.servers.keys().cloned().collect::<Vec<_>>();
         let mut discovered_tools = Vec::new();
+        let mut seen = HashSet::new();
 
         for server_name in server_names {
             let server_tools = self.discover_tools_for_server(&server_name).await?;
             self.clear_routes_for_server(&server_name);
 
             for tool in server_tools {
-                self.tool_index.insert(
-                    tool.qualified_name.clone(),
-                    ToolRoute {
-                        server_name: tool.server_name.clone(),
-                        raw_name: tool.raw_name.clone(),
-                    },
-                );
-                discovered_tools.push(tool);
+                self.register_discovered_tool(tool, &mut seen, &mut discovered_tools);
             }
         }
 
@@ -569,6 +596,7 @@ impl McpServerManager {
         let mut discovered_tools = Vec::new();
         let mut working_servers = Vec::new();
         let mut failed_servers = Vec::new();
+        let mut seen = HashSet::new();
 
         for server_name in server_names {
             match self.discover_tools_for_server(&server_name).await {
@@ -576,14 +604,7 @@ impl McpServerManager {
                     working_servers.push(server_name.clone());
                     self.clear_routes_for_server(&server_name);
                     for tool in server_tools {
-                        self.tool_index.insert(
-                            tool.qualified_name.clone(),
-                            ToolRoute {
-                                server_name: tool.server_name.clone(),
-                                raw_name: tool.raw_name.clone(),
-                            },
-                        );
-                        discovered_tools.push(tool);
+                        self.register_discovered_tool(tool, &mut seen, &mut discovered_tools);
                     }
                 }
                 Err(error) => {
@@ -2267,6 +2288,121 @@ mod tests {
 
             process.terminate().await.expect("terminate child");
             let _ = process.wait().await.expect("wait after kill");
+            cleanup_script(&script_path);
+        });
+    }
+
+    fn write_alias_collision_server_script() -> PathBuf {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("temp dir");
+        let script_path = root.join("alias-collision-mcp.py");
+        let script = [
+            "#!/usr/bin/env python3",
+            "import json, sys",
+            "def read_message():",
+            "    while True:",
+            "        line = sys.stdin.buffer.readline()",
+            "        if not line:",
+            "            return None",
+            "        line = line.strip()",
+            "        if line:",
+            "            return json.loads(line.decode())",
+            "def send_message(message):",
+            "    sys.stdout.buffer.write(json.dumps(message).encode() + b'\\n')",
+            "    sys.stdout.buffer.flush()",
+            "while True:",
+            "    request = read_message()",
+            "    if request is None:",
+            "        break",
+            "    if 'id' not in request:",
+            "        continue",
+            "    method = request['method']",
+            "    if method == 'initialize':",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {",
+            "                'protocolVersion': request['params']['protocolVersion'],",
+            "                'capabilities': {'tools': {}},",
+            "                'serverInfo': {'name': 'alias', 'version': '1.0.0'}",
+            "            }",
+            "        })",
+            "    elif method == 'tools/list':",
+            // Mirrors qdrant-memory v2.0: dotted and underscored aliases that
+            // both normalize to the same MCP-qualified tool name.
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {",
+            "                'tools': [",
+            "                    {'name': 'memory.store', 'description': 'dotted alias',",
+            "                     'inputSchema': {'type': 'object'}},",
+            "                    {'name': 'memory_store', 'description': 'underscored alias',",
+            "                     'inputSchema': {'type': 'object'}}",
+            "                ]",
+            "            }",
+            "        })",
+            "    elif method == 'tools/call':",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {'content': [{'type': 'text', 'text': 'ok'}], 'isError': False}",
+            "        })",
+            "    else:",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'error': {'code': -32601, 'message': 'unknown method'},",
+            "        })",
+            "",
+        ]
+        .join("\n");
+        fs::write(&script_path, script).expect("write script");
+        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).expect("chmod");
+        script_path
+    }
+
+    #[test]
+    fn manager_dedupes_tools_that_collapse_to_same_qualified_name() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_alias_collision_server_script();
+            let servers = BTreeMap::from([(
+                "qdrant-memory".to_string(),
+                ScopedMcpServerConfig {
+                    required: false,
+                    scope: ConfigSource::Local,
+                    config: McpServerConfig::Stdio(McpStdioServerConfig {
+                        command: "python3".to_string(),
+                        args: vec![script_path.to_string_lossy().into_owned()],
+                        env: BTreeMap::new(),
+                        tool_call_timeout_ms: Some(1_000),
+                    }),
+                },
+            )]);
+            let mut manager = McpServerManager::from_servers(&servers);
+
+            let tools = manager.discover_tools().await.expect("discover tools");
+
+            // `memory.store` and `memory_store` both normalize to the same
+            // qualified name; discovery must keep exactly one so registration
+            // does not abort the CLI, and the kept tool must still route.
+            let qualified = mcp_tool_name("qdrant-memory", "memory_store");
+            assert_eq!(tools.len(), 1, "collapsed aliases must dedup to one tool");
+            assert_eq!(tools[0].qualified_name, qualified);
+
+            let response = manager
+                .call_tool(&qualified, Some(json!({})))
+                .await
+                .expect("call deduped tool");
+            assert!(response.error.is_none());
+
+            manager.shutdown().await.expect("shutdown");
             cleanup_script(&script_path);
         });
     }

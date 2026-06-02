@@ -2248,6 +2248,7 @@ dependencies = [
  "crossterm",
  "log",
  "mock-anthropic-service",
+ "nix",
  "plugins",
  "pulldown-cmark",
  "runtime",

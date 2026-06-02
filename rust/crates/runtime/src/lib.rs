@@ -106,8 +106,9 @@ pub use journal::{
     JournalDate,
 };
 pub use kairos::{
-    kairos_enabled, startup_dream_action, AutonomousSignal, IdleBriefPolicy, StartupAction,
-    KAIROS_ENV,
+    idle_threshold_secs, kairos_enabled, run_idle_watch, startup_dream_action, AutonomousSignal,
+    IdleBriefPolicy, KairosIdleRuntime, StartupAction, DEFAULT_IDLE_SECS, IDLE_BRIEF_NOTICE,
+    KAIROS_ENV, KAIROS_IDLE_SECS_ENV,
 };
 pub use lane_events::{
     compute_event_fingerprint, dedupe_superseded_commit_events, dedupe_terminal_events,

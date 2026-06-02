@@ -10,8 +10,15 @@ use rustyline::hint::Hinter;
 use rustyline::history::DefaultHistory;
 use rustyline::validate::Validator;
 use rustyline::{
-    Cmd, CompletionType, Config, Context, EditMode, Editor, Helper, KeyCode, KeyEvent, Modifiers,
+    Cmd, CompletionType, Config, Context, EditMode, Editor, ExternalPrinter, Helper, KeyCode,
+    KeyEvent, Modifiers,
 };
+
+/// A thread-movable sink for printing an out-of-band notification (a Kairos
+/// proactive Brief) without corrupting the in-progress prompt line. In an
+/// interactive terminal it wraps rustyline's [`ExternalPrinter`] (which the
+/// readline loop pumps); otherwise it falls back to a plain stdout write.
+pub type ProactiveSink = Box<dyn FnMut(&str) + Send>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadOutcome {
@@ -163,6 +170,27 @@ impl LineEditor {
             }
             Err(error) => Err(io::Error::other(error)),
         }
+    }
+
+    /// Build a [`ProactiveSink`] for emitting an out-of-band notification from a
+    /// background thread. In an interactive terminal this is rustyline's
+    /// external printer so the current prompt line is preserved; otherwise it is
+    /// a plain stdout writer. Call this only when the autonomous layer is
+    /// enabled — in the disabled path it must never run, so no external printer
+    /// is ever created and the REPL stays byte-identical to baseline.
+    pub fn proactive_sink(&mut self) -> ProactiveSink {
+        if io::stdin().is_terminal() && io::stdout().is_terminal() {
+            if let Ok(mut printer) = self.editor.create_external_printer() {
+                return Box::new(move |message: &str| {
+                    let _ = printer.print(format!("{message}\n"));
+                });
+            }
+        }
+        Box::new(|message: &str| {
+            let mut stdout = io::stdout();
+            let _ = writeln!(stdout, "{message}");
+            let _ = stdout.flush();
+        })
     }
 
     fn current_line(&self) -> String {

@@ -5045,53 +5045,96 @@ fn run_repl(
     // the default REPL path stays byte-identical to baseline.
     maybe_spawn_startup_dream();
 
-    loop {
-        editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
-        match editor.read_line()? {
-            input::ReadOutcome::Submit(input) => {
-                let trimmed = input.trim().to_string();
-                if trimmed.is_empty() {
-                    continue;
+    // Kairos autonomous idle loop (B2). Gate first: when disabled, no idle
+    // runtime, no external printer, and no watcher thread are created, so the
+    // REPL path is byte-identical to baseline. When enabled, a background
+    // watcher polls the shared idle policy and emits one proactive Brief per
+    // idle stretch through a prompt-preserving sink.
+    let idle = runtime::kairos_enabled().then(|| {
+        std::sync::Arc::new(runtime::KairosIdleRuntime::from_idle_secs(
+            runtime::idle_threshold_secs(),
+        ))
+    });
+    let idle_watcher = idle.as_ref().map(|state| {
+        let state = std::sync::Arc::clone(state);
+        let mut sink = editor.proactive_sink();
+        std::thread::Builder::new()
+            .name("kairos-idle".to_string())
+            .spawn(move || {
+                runtime::run_idle_watch(
+                    &state,
+                    std::time::Duration::from_millis(250),
+                    &mut |message| sink(message),
+                );
+            })
+            .ok()
+    });
+
+    let loop_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        loop {
+            editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
+            match editor.read_line()? {
+                input::ReadOutcome::Submit(input) => {
+                    let trimmed = input.trim().to_string();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    // Any real submit is user activity: reset the idle stretch.
+                    if let Some(state) = &idle {
+                        state.record_activity();
+                    }
+                    if matches!(trimmed.as_str(), "/exit" | "/quit") {
+                        cli.persist_session()?;
+                        break;
+                    }
+                    match SlashCommand::parse(&trimmed) {
+                        Ok(Some(command)) => {
+                            if cli.handle_repl_command(command)? {
+                                cli.persist_session()?;
+                            }
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            eprintln!("{error}");
+                            continue;
+                        }
+                    }
+                    // Bare-word skill dispatch: if the first token of the input
+                    // matches a known skill name, invoke it as `/skills <input>`
+                    // rather than forwarding raw text to the LLM (ROADMAP #36).
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &trimmed) {
+                        editor.push_history(input);
+                        cli.record_prompt_history(&trimmed);
+                        cli.run_turn(&prompt)?;
+                        continue;
+                    }
+                    editor.push_history(input);
+                    cli.record_prompt_history(&trimmed);
+                    cli.run_turn(&trimmed)?;
                 }
-                if matches!(trimmed.as_str(), "/exit" | "/quit") {
+                input::ReadOutcome::Cancel => {}
+                input::ReadOutcome::Exit => {
                     cli.persist_session()?;
                     break;
                 }
-                match SlashCommand::parse(&trimmed) {
-                    Ok(Some(command)) => {
-                        if cli.handle_repl_command(command)? {
-                            cli.persist_session()?;
-                        }
-                        continue;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        eprintln!("{error}");
-                        continue;
-                    }
-                }
-                // Bare-word skill dispatch: if the first token of the input
-                // matches a known skill name, invoke it as `/skills <input>`
-                // rather than forwarding raw text to the LLM (ROADMAP #36).
-                let cwd = std::env::current_dir().unwrap_or_default();
-                if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &trimmed) {
-                    editor.push_history(input);
-                    cli.record_prompt_history(&trimmed);
-                    cli.run_turn(&prompt)?;
-                    continue;
-                }
-                editor.push_history(input);
-                cli.record_prompt_history(&trimmed);
-                cli.run_turn(&trimmed)?;
-            }
-            input::ReadOutcome::Cancel => {}
-            input::ReadOutcome::Exit => {
-                cli.persist_session()?;
-                break;
             }
         }
+        Ok(())
+    })();
+
+    // Stop the watcher before returning (and before `editor`/its printer drop),
+    // so no proactive Brief is printed after the REPL has decided to exit and no
+    // thread is orphaned. Runs on every exit path, including error propagation.
+    if let Some(state) = &idle {
+        state.request_stop();
+    }
+    if let Some(handle) = idle_watcher.flatten() {
+        let _ = handle.join();
     }
 
+    loop_result?;
     Ok(())
 }
 
